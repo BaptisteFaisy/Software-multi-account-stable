@@ -78,6 +78,8 @@ async fn serve_room(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(terminal::TerminalManager::default())
         .manage(PoolState::default())
         .manage(build_room_state())
@@ -154,13 +156,27 @@ fn stop_runtime(state: &PoolState) {
     }
 }
 
+/// Adresse d'ecoute du proxy de pool. Le pool est un proxy PUREMENT LOCAL,
+/// consomme via `http://localhost:{port}` : on bind donc sur loopback par
+/// defaut. Cela evite la fenetre "Pare-feu Windows Defender / Autoriser l'acces"
+/// (declenchee uniquement par un bind sur `0.0.0.0`), qui exige l'admin a chaque
+/// lancement tant qu'aucune regle n'est acceptee. Un override explicite reste
+/// possible via `CST_POOL_BIND=0.0.0.0:<port>` pour exposer le pool sur le LAN.
+fn pool_bind_addr(port: u16) -> String {
+    std::env::var("CST_POOL_BIND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
+}
+
 #[tauri::command]
 async fn pool_start(state: tauri::State<'_, PoolState>) -> Result<Value, String> {
     stop_runtime(&state);
 
     let settings = settings::load_settings_for_terminal()?;
     let port = settings.pool.port;
-    let addr = format!("0.0.0.0:{port}");
+    let addr = pool_bind_addr(port);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

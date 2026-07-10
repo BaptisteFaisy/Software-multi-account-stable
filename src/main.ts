@@ -10,6 +10,7 @@ import {
   saveRemoteConfig,
   type UnlistenFn,
 } from "./platform";
+import { initDesktopUpdater } from "./updater";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import {
@@ -42,6 +43,7 @@ import {
   Copy,
   MessagesSquare,
   Search,
+  Send,
   createIcons,
 } from "lucide";
 import "@xterm/xterm/css/xterm.css";
@@ -109,6 +111,12 @@ type KombaiStatus = {
   message?: string | null;
 };
 
+type AgentRoomConfig = {
+  enabled: boolean;
+  port: number;
+  secret: string;
+};
+
 type AppSettings = {
   accounts: AccountProfile[];
   proxies: ProxyProfile[];
@@ -121,8 +129,42 @@ type AppSettings = {
   agents: AgentProfile[];
   activeAgentId?: string | null;
   kombai: KombaiConfig;
+  agentRoom: AgentRoomConfig;
   codexBypass: boolean;
   autoDiscoverAccounts: boolean;
+};
+
+type RoomAgent = {
+  ident: string;
+  agentId: string;
+  accountId: string;
+  label: string;
+  cwd?: string | null;
+  present: boolean;
+  joinedAt: number;
+  lastSeen: number;
+};
+
+type RoomMessage = {
+  id: number;
+  ts: number;
+  from: string;
+  fromLabel: string;
+  to?: string | null;
+  kind: "room" | "dm" | "system";
+  text: string;
+};
+
+type RoomStatus = {
+  running: boolean;
+  port: number;
+  url: string;
+  snapshot: {
+    agents: RoomAgent[];
+    present: number;
+    totalMessages: number;
+    cursor: number;
+  };
 };
 
 type PoolConfig = {
@@ -306,7 +348,15 @@ type PersistedTerminalState = {
   terminals: PersistedTerminalRecord[];
 };
 
-type AppView = "terminal" | "pool" | "limits" | "dashboard" | "kombai" | "discussions" | "history";
+type AppView =
+  | "terminal"
+  | "pool"
+  | "limits"
+  | "dashboard"
+  | "kombai"
+  | "discussions"
+  | "history"
+  | "room";
 
 type DiscussionSummary = {
   // Identite LOGIQUE de la conversation (stable a travers les reprises/forks).
@@ -417,6 +467,12 @@ let discussionBusyId: string | null = null;
 let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
 let promptSearch = "";
+let roomStatus: RoomStatus | null = null;
+let roomMessages: RoomMessage[] = [];
+let roomPoll: number | null = null;
+// Destinataire choisi dans le composer : "" = diffusion salon, sinon ident d'un
+// agent (DM). Conserve entre les rendus complets.
+let roomComposeTarget = "";
 
 const lucideIcons = {
   AppWindow,
@@ -448,6 +504,7 @@ const lucideIcons = {
   Copy,
   MessagesSquare,
   Search,
+  Send,
 };
 
 const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
@@ -811,6 +868,200 @@ const stopPoolPoll = () => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Salon d'agents (Agent Room)
+// ---------------------------------------------------------------------------
+
+const roomPresentAgents = (): RoomAgent[] =>
+  roomStatus?.snapshot.agents.filter((agent) => agent.present) ?? [];
+
+const roomAgentLabel = (ident: string): string => {
+  if (ident === "operator") return "Opérateur";
+  return roomStatus?.snapshot.agents.find((agent) => agent.ident === ident)?.label ?? ident;
+};
+
+const renderRoomAgentsInner = (): string => {
+  const agents = roomPresentAgents();
+  if (!agents.length) return `<div class="empty">Aucun agent présent</div>`;
+  return agents
+    .map(
+      (agent) => `
+        <div class="room-agent">
+          <span class="live-dot on"></span>
+          <div class="room-agent-main">
+            <strong>${escapeHtml(agent.label)}</strong>
+            <small>${escapeHtml(agent.ident)}${agent.cwd ? ` · ${escapeHtml(agent.cwd)}` : ""}</small>
+          </div>
+        </div>`,
+    )
+    .join("");
+};
+
+const renderRoomFeedInner = (): string => {
+  if (!roomMessages.length) return `<div class="empty">Aucun message pour l'instant</div>`;
+  return roomMessages
+    .map((message) => {
+      if (message.kind === "system") {
+        return `<div class="room-msg system"><em>${escapeHtml(message.text)}</em></div>`;
+      }
+      const target = message.to ? ` → ${escapeHtml(roomAgentLabel(message.to))}` : "";
+      const tag = message.kind === "dm" ? ` <span class="room-tag">privé</span>` : "";
+      return `
+        <div class="room-msg ${message.kind}">
+          <div class="room-msg-head"><strong>${escapeHtml(message.fromLabel)}</strong>${target}${tag}</div>
+          <div class="room-msg-body">${escapeHtml(message.text)}</div>
+        </div>`;
+    })
+    .join("");
+};
+
+const roomTargetOptions = (): string =>
+  roomPresentAgents()
+    .map(
+      (agent) =>
+        `<option value="${escapeAttr(agent.ident)}" ${agent.ident === roomComposeTarget ? "selected" : ""}>${escapeHtml(agent.label)} (privé)</option>`,
+    )
+    .join("");
+
+const renderRoomPanel = (): string => {
+  const enabled = settings?.agentRoom?.enabled ?? false;
+  const running = roomStatus?.running ?? false;
+  const present = roomStatus?.snapshot.present ?? 0;
+  const sub = enabled
+    ? `${running ? `Actif · ${escapeHtml(roomStatus?.url ?? "")}` : "Serveur arrêté"} · ${present} agent(s) présent(s)`
+    : "Désactivé";
+  return `
+    <div class="panel room-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Salon d'agents</h2>
+          <p class="panel-sub">${sub}</p>
+        </div>
+        <div class="panel-actions">
+          <button id="roomRefresh" class="icon-button wide" title="Rafraîchir"><i data-lucide="refresh-ccw"></i></button>
+          <button id="roomToggleEnabled" class="tool-button ${enabled ? "primary" : ""}" title="${enabled ? "Désactiver le salon" : "Activer le salon"}">
+            <i data-lucide="power"></i><span>${enabled ? "Activé" : "Désactivé"}</span>
+          </button>
+        </div>
+      </div>
+      ${
+        enabled
+          ? ""
+          : `<div class="room-hint">Active le salon pour que les agents Codex se voient et se parlent (outils MCP <code>list_agents</code>, <code>send_message</code>, <code>read_messages</code>). L'app ajoute une entrée <code>agent_room</code> dans le <code>config.toml</code> de chaque compte au lancement d'un terminal — réversible à la désactivation.</div>`
+      }
+      <div class="room-grid">
+        <aside class="room-agents">
+          <div class="section-row"><span>Présents</span></div>
+          <div id="roomAgents">${renderRoomAgentsInner()}</div>
+        </aside>
+        <div class="room-main">
+          <div id="roomFeed" class="room-feed">${renderRoomFeedInner()}</div>
+          <form id="roomComposer" class="room-composer">
+            <select id="roomTarget" class="agent-select" title="Destinataire" aria-label="Destinataire">
+              <option value="">Salon (tous)</option>
+              ${roomTargetOptions()}
+            </select>
+            <input id="roomText" type="text" placeholder="Message en tant qu'opérateur…" autocomplete="off" />
+            <button type="submit" class="tool-button primary" title="Envoyer"><i data-lucide="send"></i><span>Envoyer</span></button>
+          </form>
+        </div>
+      </div>
+    </div>`;
+};
+
+const syncRoomTargetOptions = () => {
+  const select = document.querySelector<HTMLSelectElement>("#roomTarget");
+  if (!select) return;
+  // Ne reconstruit que si le nombre d'agents a change (evite de casser une
+  // selection en cours d'ouverture a chaque poll).
+  if (select.options.length - 1 === roomPresentAgents().length) return;
+  const current = select.value;
+  select.innerHTML = `<option value="">Salon (tous)</option>${roomTargetOptions()}`;
+  select.value = current;
+};
+
+const refreshRoom = async () => {
+  try {
+    roomStatus = await invoke<RoomStatus>("room_status");
+  } catch {
+    return;
+  }
+  try {
+    const result = await invoke<{ messages: RoomMessage[]; cursor: number }>("room_messages", {
+      since: 0,
+    });
+    roomMessages = result.messages ?? [];
+  } catch {
+    // le fil reste tel quel
+  }
+  if (activeView !== "room") return;
+  const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
+  const feedEl = document.querySelector<HTMLDivElement>("#roomFeed");
+  if (agentsEl && feedEl) {
+    const atBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 40;
+    agentsEl.innerHTML = renderRoomAgentsInner();
+    feedEl.innerHTML = renderRoomFeedInner();
+    syncRoomTargetOptions();
+    createIcons({ icons: lucideIcons });
+    if (atBottom) feedEl.scrollTop = feedEl.scrollHeight;
+  } else {
+    render();
+  }
+};
+
+const startRoomPoll = () => {
+  stopRoomPoll();
+  roomPoll = window.setInterval(() => void refreshRoom(), 2000);
+};
+
+const stopRoomPoll = () => {
+  if (roomPoll !== null) {
+    clearInterval(roomPoll);
+    roomPoll = null;
+  }
+};
+
+const enableRoom = async () => {
+  try {
+    await invoke("room_enable", {});
+    if (settings) settings.agentRoom.enabled = true;
+    statusText = "Salon activé";
+  } catch (error) {
+    statusText = String(error);
+  }
+  await refreshRoom();
+  render();
+};
+
+const disableRoom = async () => {
+  try {
+    await invoke("room_disable");
+    if (settings) settings.agentRoom.enabled = false;
+    statusText = "Salon désactivé";
+  } catch (error) {
+    statusText = String(error);
+  }
+  await refreshRoom();
+  render();
+};
+
+const sendRoomMessage = async () => {
+  const input = document.querySelector<HTMLInputElement>("#roomText");
+  const target = document.querySelector<HTMLSelectElement>("#roomTarget");
+  const text = input?.value.trim() ?? "";
+  if (!text) return;
+  const to = target?.value || null;
+  try {
+    await invoke("room_send", { text, to });
+    if (input) input.value = "";
+  } catch (error) {
+    statusText = String(error);
+    render();
+    return;
+  }
+  await refreshRoom();
+};
+
 const removeAccount = async (id: string | null) => {
   if (!settings || !id) return;
   const account = settings.accounts.find((candidate) => candidate.id === id);
@@ -850,12 +1101,20 @@ const setActiveView = (view: AppView) => {
               ? "Vue discussions"
               : activeView === "history"
                 ? "Vue historique"
-                : "Vue terminal";
+                : activeView === "room"
+                  ? "Vue salon"
+                  : "Vue terminal";
 
   if (activeView === "limits") {
     startLimitPoll();
   } else {
     stopLimitPoll();
+  }
+
+  if (activeView === "room") {
+    startRoomPoll();
+  } else {
+    stopRoomPoll();
   }
 
   if (activeView === "dashboard") {
@@ -887,6 +1146,7 @@ const setActiveView = (view: AppView) => {
   if (activeView === "kombai") void refreshKombaiStatus();
   if (activeView === "discussions") void refreshDiscussions();
   if (activeView === "history" && !promptHistoryLoaded) void refreshPromptHistory();
+  if (activeView === "room") void refreshRoom();
 };
 
 const refreshLimitStatus = async () => {
@@ -1154,11 +1414,27 @@ const discussionTargetFor = (discussion: DiscussionSummary): string => {
   return discussion.accountId;
 };
 
+// Le backend conserve le premier message complet dans `preview` pour que la
+// recherche porte sur davantage que le titre. Pour l'affichage, on retire le
+// titre (qui est un prefixe exact de ce message) afin de ne pas presenter deux
+// fois le meme texte dans la carte.
+const discussionSubtitle = (discussion: DiscussionSummary): string => {
+  const preview = discussion.preview?.trim() ?? "";
+  const title = discussion.title?.trim() ?? "";
+  if (!preview || !title || !preview.startsWith(title)) return preview;
+  return preview
+    .slice(title.length)
+    .replace(/^[\s:;,.!?\u2014\u2013-]+/, "")
+    .trim();
+};
+
 const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string) => {
   const busy = discussionBusyId === discussion.sessionId;
   const accounts = settings?.accounts ?? [];
   const target = discussionTargetFor(discussion);
   const willCopy = target !== discussion.accountId;
+  const title = discussion.title?.trim() || "(sans titre)";
+  const subtitle = discussionSubtitle(discussion);
   const meta = [
     discussion.cwd
       ? `<span title="${escapeAttr(discussion.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(discussion.cwd))}</span>`
@@ -1190,8 +1466,8 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
   return `
     <div class="discussion-row ${busy ? "busy" : ""}">
       <div class="discussion-main">
-        <strong>${escapeHtml(discussion.title || "(sans titre)")}</strong>
-        ${discussion.preview ? `<span class="discussion-preview">${escapeHtml(discussion.preview)}</span>` : ""}
+        <strong class="discussion-title" title="${escapeAttr(title)}">${escapeHtml(title)}</strong>
+        ${subtitle ? `<span class="discussion-preview">${escapeHtml(subtitle)}</span>` : ""}
         <span class="discussion-meta">${meta}</span>
       </div>
       <div class="discussion-actions">
@@ -1911,6 +2187,10 @@ const render = () => {
               <i data-lucide="history"></i>
               <span>Historique</span>
             </button>
+            <button id="roomToggle" class="tool-button ${activeView === "room" ? "primary" : ""}" title="Salon d'agents (communication inter-agents)">
+              <i data-lucide="users"></i>
+              <span>Salon</span>
+            </button>
             <button id="newTerminal" class="tool-button primary" title="Nouveau terminal">
               <i data-lucide="plus"></i>
               <span>Terminal</span>
@@ -1957,7 +2237,9 @@ const render = () => {
                     ? renderDiscussionsPanel()
                     : activeView === "history"
                       ? renderPromptHistoryPanel()
-                      : `<div id="terminal"></div>`}
+                      : activeView === "room"
+                        ? renderRoomPanel()
+                        : `<div id="terminal"></div>`}
         </section>
 
         <footer class="statusbar">
@@ -3316,6 +3598,31 @@ const bindUi = () => {
     setActiveView("kombai");
   });
 
+  document.querySelector<HTMLButtonElement>("#roomToggle")?.addEventListener("click", () => {
+    setActiveView("room");
+  });
+
+  document.querySelector<HTMLButtonElement>("#roomRefresh")?.addEventListener("click", () => {
+    void refreshRoom();
+  });
+
+  document.querySelector<HTMLButtonElement>("#roomToggleEnabled")?.addEventListener("click", () => {
+    if (settings?.agentRoom?.enabled) {
+      void disableRoom();
+    } else {
+      void enableRoom();
+    }
+  });
+
+  document.querySelector<HTMLSelectElement>("#roomTarget")?.addEventListener("change", (event) => {
+    roomComposeTarget = (event.target as HTMLSelectElement).value;
+  });
+
+  document.querySelector<HTMLFormElement>("#roomComposer")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendRoomMessage();
+  });
+
   document.querySelector<HTMLButtonElement>("#kombaiStart")?.addEventListener("click", () => {
     void startKombai();
   });
@@ -3712,6 +4019,7 @@ const createNewTerminal = async (
   stopLimitPoll();
   stopUsagePoll();
   stopDiscussionsPoll();
+  stopRoomPoll();
   statusText = "Demarrage terminal";
   render();
 
@@ -3924,6 +4232,7 @@ const renderRemoteLogin = (error: string | null = null) => {
 
 const boot = async () => {
   await initializePlatform();
+  void initDesktopUpdater();
 
   if (isRemoteMode() && !hasRemoteAuth()) {
     renderRemoteLogin();

@@ -38,6 +38,24 @@ env:
   ASSET_WINDOWS: cst-server-windows-x86_64.zip
 
 jobs:
+  # 0) Detecte si la signature serveur (minisign) est configuree. Sinon tout le
+  #    track serveur est saute et la Release publie quand meme le desktop
+  #    (mode "desktop d'abord" : seuls les secrets Tauri sont requis).
+  config:
+    runs-on: ubuntu-latest
+    outputs:
+      has_minisign: ${{ steps.c.outputs.has_minisign }}
+    steps:
+      - id: c
+        env:
+          MK: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -n "$MK" ]; then
+            echo "has_minisign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_minisign=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # 1) Cree une Release en brouillon ; les jobs suivants y deposent leurs assets.
   create-release:
     runs-on: ubuntu-latest
@@ -73,7 +91,8 @@ jobs:
   # 2) Compile le serveur par cible et empaquete (binaire + dist). Non signe ici :
   #    la signature est centralisee sur un seul runner (job sign-server).
   build-server:
-    needs: create-release
+    needs: [config, create-release]
+    if: needs.config.outputs.has_minisign == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -154,7 +173,8 @@ jobs:
   # 3) Signe (minisign) + empreinte (sha256) les paquets serveur sur UN runner,
   #    puis les attache a la Release. Un seul OS de signature => un seul modele.
   sign-server:
-    needs: [create-release, build-server]
+    needs: [config, create-release, build-server]
+    if: needs.config.outputs.has_minisign == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Recuperer les paquets serveur
@@ -225,6 +245,9 @@ jobs:
   # 5) Bascule la Release de brouillon a publiee une fois tous les assets deposes.
   publish-release:
     needs: [create-release, sign-server, build-desktop]
+    # Publie des que le desktop est pret, meme si le track serveur (minisign) est
+    # saute ou echoue -> une release "desktop d'abord" se publie sans minisign.
+    if: ${{ always() && needs.create-release.result == 'success' && needs.build-desktop.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Publier la Release

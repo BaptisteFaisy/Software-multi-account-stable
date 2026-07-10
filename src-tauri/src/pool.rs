@@ -542,9 +542,12 @@ fn persist_auth(home: &std::path::Path, refreshed: &Refreshed) -> Result<(), Str
     std::fs::rename(&tmp, &auth_path).map_err(|e| e.to_string())
 }
 
+/// Horodatage RFC 3339 attendu par Codex CLI pour `last_refresh` dans
+/// `auth.json` (ex. `2026-07-07T22:02:21.440539Z`). L'ancienne version ecrivait
+/// un timestamp unix suffixe d'un `Z` (`1783720131Z`), non parsable par Codex :
+/// il considerait alors le token comme invalide et forcait une reconnexion.
 fn now_rfc3339() -> String {
-    let secs = now_ts();
-    format!("{}Z", secs)
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 // ----------------------------------------------------------------------------

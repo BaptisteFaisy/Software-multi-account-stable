@@ -92,6 +92,20 @@ pub fn start_terminal(
 
     let codex_home = expand_home(&account.codex_home)?;
     std::fs::create_dir_all(&codex_home).map_err(|error| error.to_string())?;
+
+    // Bypass permanent (approbations + sandbox) ecrit dans le config.toml du
+    // compte : Codex ne redemande plus d'approbation, quel que soit le mode de
+    // lancement. Non bloquant : un echec d'ecriture ne doit pas empecher le
+    // terminal de demarrer.
+    if account.bypass {
+        if let Err(error) = crate::settings::ensure_codex_bypass_config(&codex_home) {
+            eprintln!(
+                "[bypass] config.toml non ecrit pour {}: {error}",
+                account.label
+            );
+        }
+    }
+
     let project_dir = resolve_project_dir(&account)?;
 
     let pty_system = NativePtySystem::default();

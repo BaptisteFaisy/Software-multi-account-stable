@@ -40,6 +40,10 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use uuid::Uuid;
 
 const WORKSPACE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+// Le receiver conserve les sorties produites entre le demarrage du PTY et
+// l'ouverture du WebSocket par le navigateur. Une capacite genereuse evite de
+// perdre l'ecran ANSI initial d'une TUI telle que Codex.
+const TERMINAL_EVENT_BUFFER: usize = 2_048;
 
 /// Version du binaire, exposee par `/healthz`, `/api/health` et `--version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -245,6 +249,7 @@ struct RemoteTerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
     events: broadcast::Sender<ServerWsMessage>,
+    pending_events: Mutex<Option<broadcast::Receiver<ServerWsMessage>>>,
     started_at: i64,
     account_id: String,
     account_label: String,
@@ -315,6 +320,17 @@ impl RemoteTerminalManager {
 
         let codex_home = settings::expand_home(&account.codex_home)?;
         fs::create_dir_all(&codex_home).map_err(|error| error.to_string())?;
+
+        // Bypass permanent (approbations + sandbox) dans le config.toml du compte,
+        // pour que les sessions serveur tournent sans demande d'approbation.
+        if account.bypass {
+            if let Err(error) = settings::ensure_codex_bypass_config(&codex_home) {
+                eprintln!(
+                    "[bypass] config.toml non ecrit pour {}: {error}",
+                    account.label
+                );
+            }
+        }
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -390,13 +406,17 @@ impl RemoteTerminalManager {
             .master
             .take_writer()
             .map_err(|error| error.to_string())?;
-        let (events, _) = broadcast::channel(512);
+        // Garder le receiver initial est essentiel : le shell peut produire son
+        // prompt (et Codex son premier ecran ANSI) avant que le POST /terminals
+        // ait repondu et que le navigateur ait ouvert son WebSocket.
+        let (events, initial_events) = broadcast::channel(TERMINAL_EVENT_BUFFER);
 
         let session = Arc::new(RemoteTerminalSession {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
             events: events.clone(),
+            pending_events: Mutex::new(Some(initial_events)),
             started_at: metrics::now_ts(),
             account_id: account.id.clone(),
             account_label: account.label.clone(),
@@ -450,12 +470,6 @@ impl RemoteTerminalManager {
             repo_label,
             repo_dir.to_string_lossy()
         );
-        let _ = events.send(ServerWsMessage::Status {
-            id,
-            status: "active".to_string(),
-            workspace_id: workspace_id.clone(),
-            workspace_path: repo_dir.to_string_lossy().to_string(),
-        });
         let _ = events.send(ServerWsMessage::Data { id, data: banner });
 
         if let Some(command) = request.command.or_else(|| account.startup_command.clone()) {
@@ -680,7 +694,14 @@ impl ServerConfig {
         let data_dir = std::env::var_os("CST_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/srv/cst"));
-        let bind = std::env::var("CST_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        // Loopback par defaut : un bind sur `0.0.0.0` declenche la fenetre
+        // "Pare-feu Windows" (admin) a chaque demarrage tant qu'aucune regle
+        // n'est acceptee. Pour exposer le serveur au LAN (telephone/tablette),
+        // definir explicitement `CST_BIND=0.0.0.0:8080` (la fenetre pare-feu
+        // n'apparait alors qu'une seule fois). Les noeuds de deploiement fixent
+        // deja `CST_BIND` derriere un reverse-proxy, donc ce defaut ne les change
+        // pas.
+        let bind = std::env::var("CST_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
         let admin_token = std::env::var("CST_ADMIN_TOKEN")
             .map(|value| value.trim().to_string())
             .unwrap_or_default();
@@ -1139,7 +1160,10 @@ async fn handle_terminal_socket(
     session: Arc<RemoteTerminalSession>,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let mut events = session.events.subscribe();
+    // Le premier socket recupere le receiver cree avant le spawn du PTY. Les
+    // sockets suivants reprennent le receiver remis en attente a la fermeture,
+    // ce qui couvre aussi la courte fenetre d'une reconnexion.
+    let mut events = take_terminal_event_receiver(&session.events, &session.pending_events);
     let hello = ServerWsMessage::Status {
         id,
         status: "active".to_string(),
@@ -1190,6 +1214,30 @@ async fn handle_terminal_socket(
                     }
                 }
             }
+        }
+    }
+
+    restore_terminal_event_receiver(&session.pending_events, events);
+}
+
+fn take_terminal_event_receiver(
+    events: &broadcast::Sender<ServerWsMessage>,
+    pending_events: &Mutex<Option<broadcast::Receiver<ServerWsMessage>>>,
+) -> broadcast::Receiver<ServerWsMessage> {
+    pending_events
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+        .unwrap_or_else(|| events.subscribe())
+}
+
+fn restore_terminal_event_receiver(
+    pending_events: &Mutex<Option<broadcast::Receiver<ServerWsMessage>>>,
+    receiver: broadcast::Receiver<ServerWsMessage>,
+) {
+    if let Ok(mut pending) = pending_events.lock() {
+        if pending.is_none() {
+            *pending = Some(receiver);
         }
     }
 }
@@ -1476,4 +1524,62 @@ fn system_time_to_unix(value: SystemTime) -> Option<i64> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_output_emitted_before_socket_is_replayed() {
+        let (events, initial_receiver) = broadcast::channel(8);
+        let pending = Mutex::new(Some(initial_receiver));
+
+        events
+            .send(ServerWsMessage::Data {
+                id: 7,
+                data: "initial ANSI screen".to_string(),
+            })
+            .expect("the retained receiver must keep pre-connection output");
+
+        let mut receiver = take_terminal_event_receiver(&events, &pending);
+        match receiver
+            .try_recv()
+            .expect("pre-connection output must be replayed")
+        {
+            ServerWsMessage::Data { id, data } => {
+                assert_eq!(id, 7);
+                assert_eq!(data, "initial ANSI screen");
+            }
+            other => panic!("unexpected terminal event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_output_emitted_between_sockets_is_replayed() {
+        let (events, initial_receiver) = broadcast::channel(8);
+        let pending = Mutex::new(Some(initial_receiver));
+
+        let receiver = take_terminal_event_receiver(&events, &pending);
+        restore_terminal_event_receiver(&pending, receiver);
+
+        events
+            .send(ServerWsMessage::Data {
+                id: 9,
+                data: "while disconnected".to_string(),
+            })
+            .expect("the restored receiver must keep reconnect output");
+
+        let mut resumed = take_terminal_event_receiver(&events, &pending);
+        match resumed
+            .try_recv()
+            .expect("disconnect output must be replayed")
+        {
+            ServerWsMessage::Data { id, data } => {
+                assert_eq!(id, 9);
+                assert_eq!(data, "while disconnected");
+            }
+            other => panic!("unexpected terminal event: {other:?}"),
+        }
+    }
 }

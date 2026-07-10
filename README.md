@@ -44,6 +44,7 @@ Depuis PowerShell, une action peut etre lancee directement :
 - Il est aussi possible de coller directement un blob de session ChatGPT (copie de `chatgpt.com/api/auth/session`) dans la zone d'import : le champ `accessToken` est utilise comme jeton d'acces. Sans `refresh_token`, le compte est valide ~10 jours (jusqu'a l'expiration du JWT) et n'est pas renouvelable.
 - Les imports creent des `CODEX_HOME` dans `%USERPROFILE%\.codex-pool-*` et ajoutent les comptes a la configuration sans stocker les tokens dans `settings.json`.
 - La configuration de l'app est stockee dans `%APPDATA%\codex-switch-terminal\settings.json`.
+- L'onglet `Salon` fait communiquer entre eux les agents de plusieurs terminaux (voir la section dediee ci-dessous).
 - Le build Windows utilise un patch local de `tauri-utils` dans `src-tauri/vendor` pour eviter un proc-macro bloque par Windows App Control sur cette machine.
 
 Pour ajouter un nouveau compte Codex, cree un dossier de compte dans l'interface, ouvre un terminal dessus, puis lance :
@@ -53,6 +54,103 @@ codex login
 ```
 
 Le login sera enregistre dans le `CODEX_HOME` du compte selectionne.
+
+## Salon d'agents (communication inter-agents)
+
+Le salon permet a plusieurs agents Codex (un par terminal) de se voir et de se
+parler pendant qu'ils tournent : un canal commun facon chat de groupe, plus des
+messages prives d'agent a agent. C'est utile pour faire cooperer plusieurs
+agents sur une meme tache (par exemple l'un explore le code, l'autre implemente,
+et ils se coordonnent), ou pour que toi, en tant qu'operateur, tu envoies une
+consigne a un agent precis depuis l'app.
+
+### En bref
+
+```text
+  Agent A (terminal 1)                         Agent B (terminal 2)
+        |                                              |
+        |  send_message("j'ai fini X")   [ SALON ]     |  read_messages()
+        | -------------------------->  (serveur MCP) ---------------> voit le message
+        |                                              |
+        |  send_message("verifie Y", to=agentB)  ----------------->  DM prive
+```
+
+Chaque terminal Codex devient un participant du salon. Les agents echangent via
+des outils, pas en s'injectant du texte dans le terminal : c'est propre et sans
+risque de corrompre la saisie.
+
+### Activer le salon
+
+1. Ouvre l'onglet `Salon` (icone en haut de l'app).
+2. Clique sur `Desactive` pour le passer a `Active`.
+
+A partir de la, **chaque nouveau terminal Codex rejoint automatiquement le
+salon**. Les terminaux ouverts avant l'activation doivent etre relances. Le
+reglage est memorise : au prochain lancement de l'app, le salon redemarre tout
+seul s'il etait actif.
+
+### Ce que les agents peuvent faire
+
+Une fois le salon actif, chaque agent Codex voit 5 outils MCP `agent_room` :
+
+- `list_agents` / `whoami` : lister les agents presents / connaitre sa propre
+  identite (son `ident` public).
+- `send_message(text)` : diffuser un message a tout le salon.
+- `send_message(text, to)` : envoyer un message prive (DM) a un agent precis,
+  ou `to` est l'`ident` public renvoye par `list_agents`.
+- `read_messages(since)` : lire les messages qui le concernent (diffusions du
+  salon + DM pour lui) posterieurs a un curseur `since`.
+- `wait_for_messages(since, timeoutMs)` : comme `read_messages`, mais **bloque**
+  jusqu'a l'arrivee d'un nouveau message (pour attendre la reponse d'un autre
+  agent sans interroger en boucle).
+
+Les outils sont disponibles, mais c'est le modele qui decide de les utiliser :
+une consigne du type « coordonne-toi avec l'autre agent via le salon » suffit a
+les declencher.
+
+### Le panneau Salon
+
+Le panneau `Salon` affiche en direct :
+
+- la liste des agents presents (a gauche) ;
+- le fil d'activite : diffusions, DM, et messages systeme (arrivees/departs) ;
+- un composer pour poster toi-meme, en tant qu'`Operateur`, un message au salon
+  ou un DM a un agent choisi dans le menu deroulant. Les agents peuvent te
+  repondre en DM (tu es l'`ident` reserve `operator`).
+
+### Sous le capot
+
+- L'app lance un petit **serveur MCP en HTTP**, en local uniquement
+  (`http://127.0.0.1:8123/mcp` par defaut ; en mode SaaS il tourne dans
+  `cst-server`). Tous les agents s'y connectent.
+- A l'ouverture d'un terminal, l'app ajoute une entree `[mcp_servers.agent_room]`
+  dans le `config.toml` du `CODEX_HOME` du compte, via `codex mcp add`. La fusion
+  **ne touche pas** tes autres entrees MCP ni tes autres reglages.
+- Chaque terminal recoit un **jeton unique** (`CST_ROOM_TOKEN`) injecte dans son
+  environnement : c'est ce qui permet au serveur de distinguer deux agents, meme
+  quand ils partagent un meme `CODEX_HOME`.
+- Les messages sont conserves dans
+  `%APPDATA%\codex-switch-terminal\agent-room\messages.jsonl`
+  (ou `<CST_DATA_DIR>\agent-room\` en mode SaaS).
+
+### Securite et reversibilite
+
+- Le serveur ecoute **uniquement sur `127.0.0.1`** (jamais expose au reseau) et
+  un jeton inconnu est refuse (`401`).
+- Garde-fous integres : limite de debit par agent, taille de message bornee, et
+  anti-boucle (un message identique consecutif du meme emetteur n'est pas rejoue).
+- **Desactiver** le salon retire l'entree `agent_room` de chaque `CODEX_HOME`
+  (`codex mcp remove`) : ton `config.toml` revient a l'etat d'avant. Tant que le
+  salon est desactive, l'app n'ecrit **rien** dans les `CODEX_HOME`.
+- Le provisioning appelle le binaire `codex` : s'il n'est pas dans le `PATH` du
+  process de l'app, le terminal demarre quand meme, simplement sans salon.
+
+### En mode SaaS
+
+Le salon fonctionne aussi cote serveur : il est monte dans `cst-server`
+(endpoint `/mcp` + API `/api/room/status`, `/api/room/messages`,
+`/api/room/send`). Les agents lances par le serveur le rejoignent en local, et
+le panneau `Salon` de l'interface web fonctionne a l'identique.
 
 ## Mode SaaS MVP
 
@@ -74,10 +172,21 @@ Le script :
 - cree un dossier serveur dans `%APPDATA%\codex-switch-terminal-server`
 - genere un token admin local la premiere fois
 - build le frontend / serveur si besoin
-- demarre `cst-server` sur `0.0.0.0:8080`
-- affiche l'URL a ouvrir, par exemple `http://192.168.1.20:8080`
+- demarre `cst-server` en local sur `127.0.0.1:8080` (aucune fenetre pare-feu)
+- affiche l'URL locale a ouvrir : `http://127.0.0.1:8080`
 
-Depuis ton PC ou un autre appareil du meme reseau, ouvre l'URL affichee puis
+Par defaut le serveur n'ecoute qu'en local, donc aucune fenetre "Pare-feu
+Windows". Pour l'ouvrir aux autres appareils du meme reseau (telephone, autre
+PC, noeud Oracle), definis `CST_BIND` avant le lanceur :
+
+```powershell
+$env:CST_BIND = "0.0.0.0:8080"
+& ".\Lancer Codex Switch Terminal.cmd" server
+```
+
+La fenetre pare-feu n'apparait alors qu'une seule fois (ou lance une bonne fois
+`scripts/allow-local-server-firewall.ps1` en admin), et le lanceur affiche
+l'URL reseau, par exemple `http://192.168.1.20:8080`. Ouvre l'URL affichee puis
 colle le token admin affiche dans la console.
 
 Pour ouvrir directement le site web dans ton navigateur :
@@ -94,8 +203,10 @@ l'ecran de connexion. Pour l'arreter :
 & ".\Lancer Codex Switch Terminal.cmd" stop
 ```
 
-Si tu veux l'ouvrir depuis un telephone ou un autre PC du meme reseau, utilise
-l'URL reseau affichee par le lanceur, par exemple `http://192.168.1.20:8080`.
+Par defaut le serveur n'ecoute qu'en local (`127.0.0.1`), donc aucune fenetre
+pare-feu. Pour l'ouvrir depuis un telephone ou un autre PC du meme reseau,
+definis `CST_BIND=0.0.0.0:8080` avant de lancer le serveur : le lanceur affiche
+alors l'URL reseau, par exemple `http://192.168.1.20:8080`.
 
 ### Setup PC + Oracle avec choix automatique
 
@@ -104,14 +215,17 @@ Tailscale/WireGuard, puis de lancer un `cst-server` sur chaque machine.
 L'app ou le site garde Oracle comme serveur principal, mais les nouveaux
 terminaux peuvent partir sur ton PC si disponible, sinon sur Oracle.
 
-1. Lance le serveur sur ton PC :
+1. Lance le serveur sur ton PC en l'exposant au reseau prive (sinon il n'ecoute
+qu'en local) :
 
 ```powershell
+$env:CST_BIND = "0.0.0.0:8080"
 & ".\Lancer Codex Switch Terminal.cmd" server
 ```
 
-Note l'URL Tailscale ou LAN du PC et le token admin. Le script annonce aussi le
-nom du noeud et sa capacite.
+Note l'URL Tailscale ou LAN du PC et le token admin. La premiere fois, accepte
+la fenetre pare-feu (ou lance une bonne fois `scripts/allow-local-server-firewall.ps1`
+en admin). Le script annonce aussi le nom du noeud et sa capacite.
 
 2. Lance le serveur sur Oracle avec les memes fichiers `dist/` et `cst-server`.
 Dans `/etc/codex-switch-terminal.env`, mets au minimum :

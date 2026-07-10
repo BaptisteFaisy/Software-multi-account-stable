@@ -26,6 +26,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5QkIyN0E4QzExOUM0NzQKUldSMHhCbkJxQ2U3U1F1anAzM1RLZ0FMNVVPRUV4Snl6UUQ2VW5IN1dsM2JCSFJuaUN6SG5UNE4K",
+      "endpoints": [
+        "https://github.com/BaptisteFaisy/Software-multi-account/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

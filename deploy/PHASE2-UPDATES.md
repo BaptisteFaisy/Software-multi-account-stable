@@ -59,8 +59,9 @@ cat minisign.pub                                  # 2e ligne = la clé publique 
 ### 1b. tauri signer (app desktop)
 
 ```bash
-npx tauri signer generate -- -w cst-updater.key   # demande un mot de passe
-# -> écrit la clé privée dans cst-updater.key et AFFICHE la clé publique (base64)
+# Lancer DEPUIS le dossier du projet ; écrire la clé privée HORS du repo.
+npx tauri signer generate -w "$HOME/cst-updater.key"   # demande un mot de passe
+# -> écrit la clé privée dans ~/cst-updater.key et AFFICHE la clé publique (base64)
 ```
 
 - `cst-updater.key` (privée) → secret CI `TAURI_SIGNING_PRIVATE_KEY`.

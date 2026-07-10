@@ -287,6 +287,20 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         sessionId: args.sessionId,
         archive: args.archive,
       });
+    case "room_status":
+      return api<T>("GET", "/api/room/status");
+    case "room_messages":
+      return api<T>(
+        "GET",
+        `/api/room/messages${args.since ? `?since=${encodeURIComponent(args.since)}` : ""}`,
+      );
+    case "room_send":
+      return api<T>("POST", "/api/room/send", { text: args.text, to: args.to ?? null });
+    // En SaaS le salon est toujours actif (monte dans le serveur) : enable/disable
+    // cote client sont des no-op qui renvoient l'etat courant.
+    case "room_enable":
+    case "room_disable":
+      return api<T>("GET", "/api/room/status");
     default:
       throw new Error(`Commande remote non supportee: ${command}`);
   }
@@ -505,16 +519,9 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
     } else if (message.type === "error") {
       emit("pty-data", { id: message.id, data: `\r\n${message.message}\r\n` });
     } else if (message.type === "status") {
-      // Le message WS "status" peut arriver en camelCase (workspacePath) ou en
-      // snake_case (workspace_path) selon la version du noeud : on tolere les
-      // deux pour ne pas afficher "undefined" (utile aussi pendant une mise a
-      // jour rolling ou d'anciens et nouveaux noeuds coexistent).
-      const workspacePath =
-        message.workspacePath ?? (message as unknown as { workspace_path?: string }).workspace_path ?? "";
-      emit("pty-data", {
-        id: message.id,
-        data: `\r\n[Workspace] ${workspacePath}\r\n`,
-      });
+      // Message de controle uniquement. L'injecter dans xterm deplace le
+      // curseur a l'insu de la TUI et son prochain redraw peut alors effacer la
+      // ligne en cours. Le chemin du workspace figure deja dans la banniere PTY.
     }
   });
 

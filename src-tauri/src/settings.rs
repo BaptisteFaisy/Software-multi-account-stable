@@ -488,6 +488,101 @@ mod tests {
         assert_session_blob_import(&quoted_json_string);
     }
 
+    #[test]
+    fn upsert_inserts_key_into_empty_document() {
+        let out = upsert_top_level_string("", "approval_policy", "never");
+        assert_eq!(out, "approval_policy = \"never\"\n");
+    }
+
+    #[test]
+    fn upsert_prefixes_key_before_existing_tables() {
+        let existing = "[mcp_servers.agent_room]\nurl = \"http://127.0.0.1:8123/mcp\"\n";
+        let out = upsert_top_level_string(existing, "sandbox_mode", "danger-full-access");
+        // La cle racine doit preceder la table pour rester du TOML valide.
+        assert!(out.starts_with("sandbox_mode = \"danger-full-access\"\n"));
+        assert!(out.contains("[mcp_servers.agent_room]"));
+    }
+
+    #[test]
+    fn upsert_replaces_existing_top_level_value() {
+        let existing = "approval_policy = \"on-request\"\nmodel = \"gpt-5\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(!out.contains("on-request"));
+        assert!(out.contains("model = \"gpt-5\""));
+        // Une seule occurrence de la cle (pas de doublon => TOML valide).
+        assert_eq!(out.matches("approval_policy").count(), 1);
+    }
+
+    #[test]
+    fn upsert_ignores_same_key_inside_a_table_and_comments() {
+        let existing = "# approval_policy = \"never\"\n[profiles.x]\napproval_policy = \"untrusted\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        // La cle sous [profiles.x] et la ligne commentee ne sont pas touchees ;
+        // la cle racine est prefixee.
+        assert!(out.starts_with("approval_policy = \"never\"\n"));
+        assert!(out.contains("[profiles.x]"));
+        assert!(out.contains("approval_policy = \"untrusted\""));
+        assert!(out.contains("# approval_policy = \"never\""));
+    }
+
+    #[test]
+    fn upsert_does_not_match_key_prefix() {
+        // `approval_policy_extra` ne doit pas etre confondu avec `approval_policy`.
+        let existing = "approval_policy_extra = \"x\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.starts_with("approval_policy = \"never\"\n"));
+        assert!(out.contains("approval_policy_extra = \"x\""));
+    }
+
+    #[test]
+    fn upsert_is_idempotent() {
+        let once = upsert_top_level_string("", "approval_policy", "never");
+        let twice = upsert_top_level_string(&once, "approval_policy", "never");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn upsert_does_not_misfire_inside_multiline_string() {
+        // Une chaine multi-ligne contenant une ligne `[...]` ET une ligne
+        // `approval_policy = ...` ne doit NI latcher in_table NI etre prise pour
+        // la vraie cle top-level. La vraie cle (apres la chaine) est remplacee.
+        let existing = "notify_tpl = \"\"\"\n[warn] hi\napproval_policy = \"x\"\n\"\"\"\napproval_policy = \"on-request\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        // Contenu de la chaine preserve tel quel.
+        assert!(out.contains("[warn] hi"));
+        assert!(out.contains("approval_policy = \"x\""));
+        // Une seule occurrence EFFECTIVE remplacee, pas de doublon top-level.
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(!out.contains("on-request"));
+        // Pas de prefixe : la cle a ete remplacee en place, donc le fichier
+        // commence toujours par la chaine multi-ligne.
+        assert!(out.starts_with("notify_tpl = \"\"\""));
+        assert_eq!(out.matches("approval_policy = \"never\"").count(), 1);
+    }
+
+    #[test]
+    fn upsert_does_not_latch_on_multiline_array_rows() {
+        // Un tableau multi-ligne dont des lignes commencent par `[` ne doit pas
+        // etre pris pour une table : la cle top-level qui suit reste remplacable.
+        let existing = "matrix = [\n[1, 2],\n[3, 4],\n]\napproval_policy = \"on-request\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.contains("matrix = ["));
+        assert!(out.contains("[1, 2],"));
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(!out.contains("on-request"));
+        assert!(out.starts_with("matrix = ["));
+    }
+
+    #[test]
+    fn upsert_is_utf8_safe() {
+        // Ne doit pas paniquer sur des caracteres multi-octets (chemins accentues).
+        let existing = "label = \"Café Références ☕\"\n[mcp_servers.x]\nurl = \"http://é\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.starts_with("approval_policy = \"never\"\n"));
+        assert!(out.contains("Café Références ☕"));
+    }
+
     fn empty_settings(
         codex_command: &str,
         agents: Vec<AgentProfile>,
@@ -1756,6 +1851,162 @@ fn now_unix() -> i64 {
 /// casse le parseur de Codex ("input contains invalid characters").
 fn now_iso8601() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Ecrit (idempotent) le "bypass" permanent de Codex dans le `config.toml` du
+/// CODEX_HOME : `approval_policy = "never"` et `sandbox_mode = "danger-full-access"`.
+///
+/// Contrairement au flag `--dangerously-bypass-approvals-and-sandbox` (ajoute
+/// uniquement quand l'app lance elle-meme Codex, et seulement pour l'agent Codex
+/// integre), ces cles s'appliquent quel que soit le mode de lancement : bouton
+/// Run, `codex resume`, ou saisie manuelle dans le terminal. Resultat : plus
+/// aucune demande d'approbation ni d'ecran de confiance de dossier.
+///
+/// Best-effort et non destructif : si une cle existe deja au niveau racine, sa
+/// valeur est remplacee ; les autres entrees du fichier (dont `[mcp_servers.*]`)
+/// sont preservees. Ecriture atomique.
+pub fn ensure_codex_bypass_config(home: &Path) -> std::io::Result<()> {
+    let path = home.join("config.toml");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+
+    let updated = upsert_top_level_string(&existing, "approval_policy", "never");
+    let updated = upsert_top_level_string(&updated, "sandbox_mode", "danger-full-access");
+
+    if updated == existing {
+        return Ok(());
+    }
+
+    let tmp = home.join("config.toml.cst-tmp");
+    fs::write(&tmp, updated)?;
+    fs::rename(&tmp, &path)
+}
+
+/// Insere ou remplace une cle scalaire chaine AU NIVEAU RACINE d'un document TOML
+/// (avant toute table `[section]`). Ne touche jamais une cle de meme nom situee
+/// dans une table, une chaine multi-ligne (`"""`/`'''`), un tableau multi-ligne,
+/// ni une ligne commentee. Si la cle est absente, elle est prefixee (une cle
+/// racine doit preceder toute table pour rester du TOML valide).
+///
+/// Ce n'est pas un parseur TOML complet, mais il suit l'etat des chaines
+/// multi-lignes et la profondeur des crochets pour ne pas confondre le CONTENU
+/// d'une valeur avec une structure top-level (ce qui pourrait dupliquer une cle
+/// et corrompre le fichier).
+fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
+    let desired = format!("{key} = \"{value}\"");
+    let mut out = String::with_capacity(content.len() + desired.len() + 1);
+    let mut replaced = false;
+    let mut in_table = false;
+    // Etat de lexing, evalue au DEBUT de chaque ligne.
+    let mut ml: Option<&'static str> = None; // chaine multi-ligne ouverte
+    let mut depth: i32 = 0; // profondeur de crochets (tableaux multi-lignes)
+
+    for line in content.lines() {
+        // Une ligne n'est "top-level" que hors chaine multi-ligne et hors tableau.
+        let at_top_level = ml.is_none() && depth == 0;
+        let trimmed = line.trim_start();
+
+        let mut is_target = false;
+        if at_top_level {
+            if trimmed.starts_with('[') {
+                in_table = true;
+            } else if !replaced
+                && !in_table
+                && !trimmed.starts_with('#')
+                && trimmed
+                    .strip_prefix(key)
+                    .map(|rest| rest.trim_start().starts_with('='))
+                    .unwrap_or(false)
+            {
+                is_target = true;
+            }
+        }
+
+        if is_target {
+            out.push_str(&desired);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        advance_toml_lex(line, &mut ml, &mut depth);
+    }
+
+    if replaced {
+        out
+    } else if content.is_empty() {
+        format!("{desired}\n")
+    } else {
+        format!("{desired}\n{content}")
+    }
+}
+
+/// Fait avancer l'etat de lexing TOML (chaine multi-ligne ouverte, profondeur de
+/// crochets) au fil d'une ligne. UTF-8 safe : toutes les decoupes se font sur des
+/// frontieres de caracteres. Ne vise pas la conformite TOML complete, juste de
+/// quoi distinguer le niveau racine du contenu des valeurs.
+fn advance_toml_lex(line: &str, ml: &mut Option<&'static str>, depth: &mut i32) {
+    let mut rest = line;
+    loop {
+        // Dans une chaine multi-ligne : on cherche sa fermeture.
+        if let Some(delim) = *ml {
+            match rest.find(delim) {
+                Some(pos) => {
+                    *ml = None;
+                    rest = &rest[pos + delim.len()..];
+                }
+                None => return,
+            }
+            continue;
+        }
+
+        let Some(c) = rest.chars().next() else {
+            return;
+        };
+
+        // Ouverture d'une chaine multi-ligne ?
+        if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
+            let delim = if rest.starts_with("\"\"\"") {
+                "\"\"\""
+            } else {
+                "'''"
+            };
+            let after_open = &rest[3..];
+            match after_open.find(delim) {
+                Some(pos) => rest = &after_open[pos + 3..], // ouverte + fermee ici
+                None => {
+                    *ml = Some(delim);
+                    return;
+                }
+            }
+            continue;
+        }
+
+        match c {
+            // Commentaire : le reste de la ligne est ignore.
+            '#' => return,
+            // Chaine simple ligne : consommee jusqu'a sa fermeture (ou fin de ligne).
+            '"' | '\'' => {
+                let after = &rest[c.len_utf8()..];
+                match after.find(c) {
+                    Some(pos) => rest = &after[pos + c.len_utf8()..],
+                    None => return,
+                }
+            }
+            '[' => {
+                *depth += 1;
+                rest = &rest[1..];
+            }
+            ']' => {
+                if *depth > 0 {
+                    *depth -= 1;
+                }
+                rest = &rest[1..];
+            }
+            _ => rest = &rest[c.len_utf8()..],
+        }
+    }
 }
 
 fn normalize_string_path(value: &str) -> String {
