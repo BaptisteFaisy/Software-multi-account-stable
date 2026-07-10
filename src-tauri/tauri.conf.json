@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex Switch Terminal",
+  "version": "0.1.0",
+  "identifier": "dev.jeanp.codex-switch-terminal",
+  "build": {
+    "beforeDevCommand": "npm run dev:frontend",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:frontend",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Codex Switch Terminal",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 620
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico"]
+  }
+}

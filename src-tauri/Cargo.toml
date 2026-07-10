@@ -1,0 +1,48 @@
+[package]
+name = "codex-switch-terminal"
+version = "0.1.0"
+description = "Tauri terminal for switching Codex accounts and proxies"
+authors = ["jeanp"]
+edition = "2021"
+default-run = "codex-switch-terminal"
+
+[lib]
+name = "codex_switch_terminal_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "codex-switch-terminal"
+path = "src/main.rs"
+
+[[bin]]
+name = "cst-server"
+path = "src/bin/cst-server.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+# `process` (absent des features runtime) sert au test d'integration live qui
+# pilote un vrai `codex exec` contre le serveur MCP du salon.
+tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "time"] }
+
+[dependencies]
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+axum = { version = "0.7", features = ["json", "ws"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2"] }
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rfd = "0.15"
+uuid = { version = "1", features = ["v4"] }
+
+[patch.crates-io]
+tauri-utils = { path = "vendor/tauri-utils-2.9.3" }
+portable-pty = { path = "vendor/portable-pty-0.9.0" }

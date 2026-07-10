@@ -1,0 +1,239 @@
+# Release CI — Phase 2 des mises a jour dynamiques.
+#
+# Declencheur : push d'un tag `vX.Y.Z`. Le workflow produit une GitHub Release
+# avec des artefacts SIGNES :
+#   - Serveur (cst-server + dist) par cible, empaquete, avec .sha256 + .minisig
+#     (minisign / Ed25519) -> consommes par deploy/update-node.sh et
+#     scripts/update-node.ps1 (verification fail-closed avant bascule).
+#   - Desktop (NSIS/MSI signes Tauri) + latest.json -> consommes par l'updater
+#     in-app Tauri (plugins.updater).
+#
+# La version applicative vient de src-tauri/Cargo.toml / tauri.conf.json ; le tag
+# doit correspondre (v0.1.0 -> version 0.1.0). Le commit git est injecte au build
+# via CST_GIT_COMMIT (le .git n'existe pas sur les noeuds : build.rs ne peut pas
+# le deviner).
+#
+# SECRETS requis (Settings > Secrets and variables > Actions) :
+#   MINISIGN_SECRET_KEY                  contenu du fichier cle privee minisign
+#   MINISIGN_PASSWORD                    mot de passe de la cle (vide si -W)
+#   TAURI_SIGNING_PRIVATE_KEY            cle privee `tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   mot de passe de cette cle
+# Voir deploy/PHASE2-UPDATES.md pour la generation des cles.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Necessaire pour creer la Release et y attacher des assets via GITHUB_TOKEN.
+permissions:
+  contents: write
+
+env:
+  # Noms d'assets serveur : DOIVENT rester alignes avec les scripts updater
+  # (deploy/update-node.sh, scripts/update-node.ps1).
+  ASSET_LINUX: cst-server-linux-x86_64.tar.gz
+  ASSET_WINDOWS: cst-server-windows-x86_64.zip
+
+jobs:
+  # 1) Cree une Release en brouillon ; les jobs suivants y deposent leurs assets.
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Resoudre le tag
+        id: meta
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+      - name: Creer la Release (brouillon)
+        id: create
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = process.env.GITHUB_REF_NAME;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Codex Switch Terminal ${tag}`,
+              body: [
+                'Mise a jour Codex Switch Terminal.',
+                '',
+                '- **Serveur** : `cst-server` + `dist`, signes minisign (`.minisig`) avec empreinte `.sha256`.',
+                '- **Desktop** : installeurs signes Tauri + `latest.json` (auto-updater in-app).',
+              ].join('\n'),
+              draft: true,
+              prerelease: false,
+            });
+            core.setOutput('release_id', data.id);
+
+  # 2) Compile le serveur par cible et empaquete (binaire + dist). Non signe ici :
+  #    la signature est centralisee sur un seul runner (job sign-server).
+  build-server:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: cst-server-linux-x86_64.tar.gz
+            bin: cst-server
+          - os: windows-latest
+            asset: cst-server-windows-x86_64.zip
+            bin: cst-server.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # cst-server depend de la lib (qui `use` tauri) -> les libs systeme GUI sont
+      # requises pour COMPILER meme le binaire serveur headless sur Linux.
+      - name: Dependances systeme (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential file libssl-dev pkg-config patchelf \
+            libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev
+
+      - name: Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend (dist)
+        run: |
+          npm ci
+          npm run build:frontend
+
+      - name: Build cst-server (release)
+        env:
+          CST_GIT_COMMIT: ${{ github.sha }}
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --bin cst-server
+
+      # Self-check d'artefact : le binaire doit repondre a --version.
+      - name: Self-check --version
+        shell: bash
+        run: |
+          "src-tauri/target/release/${{ matrix.bin }}" --version
+
+      - name: Empaqueter (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          install -m 0755 "src-tauri/target/release/cst-server" "$stage/cst-server"
+          cp -a dist "$stage/dist"
+          tar -C "$stage" -czf "${{ matrix.asset }}" cst-server dist
+
+      - name: Empaqueter (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $stage = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "stage") -Force
+          Copy-Item "src-tauri/target/release/cst-server.exe" (Join-Path $stage "cst-server.exe") -Force
+          Copy-Item "dist" (Join-Path $stage "dist") -Recurse -Force
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath "${{ matrix.asset }}" -Force
+
+      - name: Uploader l'artefact de build
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.os }}
+          path: ${{ matrix.asset }}
+          retention-days: 1
+
+  # 3) Signe (minisign) + empreinte (sha256) les paquets serveur sur UN runner,
+  #    puis les attache a la Release. Un seul OS de signature => un seul modele.
+  sign-server:
+    needs: [create-release, build-server]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer les paquets serveur
+        uses: actions/download-artifact@v4
+        with:
+          pattern: server-*
+          merge-multiple: true
+          path: pkgs
+
+      - name: Installer minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Signer + empreinter + attacher a la Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::secret MINISIGN_SECRET_KEY absent (voir deploy/PHASE2-UPDATES.md)."
+            exit 1
+          fi
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          cd pkgs
+          for f in *.tar.gz *.zip; do
+            [ -e "$f" ] || continue
+            # .sha256 avec le SEUL basename -> `sha256sum -c` fonctionne cote noeud.
+            sha256sum "$f" > "$f.sha256"
+            printf '%s\n' "${MINISIGN_PASSWORD:-}" | \
+              minisign -S -s ../minisign.key -m "$f" -t "codex-switch-terminal $TAG"
+            gh release upload "$TAG" "$f" "$f.sha256" "$f.minisig" --clobber
+          done
+          rm -f ../minisign.key
+
+  # 4) Desktop : tauri-action compile + signe (NSIS/MSI) et publie latest.json
+  #    dans la meme Release. Requiert plugins.updater + createUpdaterArtifacts
+  #    dans tauri.conf.json (voir deploy/PHASE2-UPDATES.md) ; sans ca, il produit
+  #    des installeurs non-updatables mais ne casse pas le workflow.
+  build-desktop:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Build + sign desktop (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CST_GIT_COMMIT: ${{ github.sha }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+  # 5) Bascule la Release de brouillon a publiee une fois tous les assets deposes.
+  publish-release:
+    needs: [create-release, sign-server, build-desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publier la Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ needs.create-release.outputs.release_id }},
+              draft: false,
+            });

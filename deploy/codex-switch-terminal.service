@@ -1,0 +1,24 @@
+[Unit]
+Description=Codex Switch Terminal SaaS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cst
+Group=cst
+WorkingDirectory=/opt/codex-switch-terminal
+EnvironmentFile=/etc/codex-switch-terminal.env
+Environment=PATH=/home/cst/.local/bin:/home/cst/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Lance la release active via le lien 'current' -> releases/<version>.
+# La mise a jour repointe 'current' puis redemarre le service.
+ExecStart=/opt/codex-switch-terminal/current/cst-server
+Restart=on-failure
+RestartSec=5
+# Laisse le temps a l'arret propre (SIGTERM gere par le serveur) avant SIGKILL.
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
