@@ -1627,6 +1627,112 @@ button {
   accent-color: #d2ae4f;
 }
 
+/* --- Selecteur de workspace ------------------------------------------- */
+.workspace-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.workspace-control .tool-button span {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-path-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 16px 18px 10px;
+}
+
+.ws-path-row input {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid #3d392f;
+  border-radius: 8px;
+  background: #11100e;
+  color: #e8e1d2;
+  outline: 0;
+  padding: 0 10px;
+}
+
+.ws-path-row input:focus {
+  border-color: #d2ae4f;
+}
+
+.ws-current {
+  padding: 0 18px 8px;
+  color: #a9a291;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.ws-current strong {
+  color: #e8e1d2;
+}
+
+.ws-hint {
+  padding: 4px 18px;
+  color: #a9a291;
+  font-size: 13px;
+}
+
+.ws-error {
+  padding: 8px 18px;
+  color: #f06f6c;
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.ws-list {
+  display: grid;
+  gap: 2px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 6px 12px 14px;
+}
+
+.ws-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #e8e1d2;
+  padding: 9px 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ws-entry:hover {
+  background: #1c1a16;
+  border-color: #3d392f;
+}
+
+.ws-entry i {
+  width: 16px;
+  height: 16px;
+  color: #d2ae4f;
+  flex: 0 0 auto;
+}
+
+.ws-entry span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-parent {
+  color: #a9a291;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -1783,7 +1889,6 @@ body {
 
 .tool-button,
 .icon-button,
-.dashboard-tabs button,
 .dashboard-table-actions button,
 .dashboard-segment button {
   border: 1px solid var(--line);
@@ -1795,7 +1900,6 @@ body {
 
 .tool-button:hover:not(:disabled),
 .icon-button:hover:not(:disabled),
-.dashboard-tabs button:hover,
 .dashboard-table-actions button:hover,
 .dashboard-segment button:hover {
   background: var(--panel-muted);
@@ -1803,7 +1907,6 @@ body {
 
 .tool-button.primary,
 .icon-button.active,
-.dashboard-tabs button.active,
 .dashboard-segment button.active {
   border-color: var(--accent);
   background: var(--accent);
@@ -2052,8 +2155,7 @@ body {
   font-size: 12px;
 }
 
-.dashboard-segment,
-.dashboard-tabs {
+.dashboard-segment {
   display: flex;
   flex-wrap: wrap;
   gap: 0;
@@ -2066,13 +2168,11 @@ body {
   font-size: 12px;
 }
 
-.dashboard-segment button:first-child,
-.dashboard-tabs button:first-child {
+.dashboard-segment button:first-child {
   border-radius: var(--radius) 0 0 var(--radius);
 }
 
-.dashboard-segment button:last-child,
-.dashboard-tabs button:last-of-type {
+.dashboard-segment button:last-child {
   border-radius: 0 var(--radius) var(--radius) 0;
 }
 
@@ -2112,9 +2212,15 @@ body {
   font-size: 11px;
 }
 
-.dashboard-tabs {
+.dashboard-table-toolbar {
+  display: flex;
   align-items: center;
   margin-top: 4px;
+}
+
+.dashboard-table-toolbar .dashboard-table-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .usage-table-wrap {
@@ -2126,30 +2232,6 @@ body {
 .tab-close {
   border-color: var(--line);
   color: var(--muted);
-}
-
-.dashboard-tabs button {
-  height: 32px;
-  padding: 0 12px;
-  font-size: 12px;
-}
-
-.dashboard-tabs button span {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  margin-left: 6px;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.dashboard-tabs button.active span {
-  background: rgba(255, 255, 255, 0.17);
-  color: #ffffff;
 }
 
 .dashboard-table-actions {
@@ -2246,17 +2328,13 @@ body {
     padding: 12px;
   }
 
-  .dashboard-segment,
-  .dashboard-tabs {
+  .dashboard-segment {
     gap: 6px;
   }
 
   .dashboard-segment button,
-  .dashboard-tabs button,
   .dashboard-segment button:first-child,
-  .dashboard-segment button:last-child,
-  .dashboard-tabs button:first-child,
-  .dashboard-tabs button:last-of-type {
+  .dashboard-segment button:last-child {
     border-radius: var(--radius);
   }
 

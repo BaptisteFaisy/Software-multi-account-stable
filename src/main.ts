@@ -117,6 +117,16 @@ type AgentRoomConfig = {
   secret: string;
 };
 
+// Entree/reponse du navigateur de dossiers du serveur (mode web). En desktop on
+// utilise le dialogue natif (`pick_project_dir`), pas cette API.
+type FsEntry = { name: string; path: string; isDir: boolean };
+type FsListResponse = {
+  root: string;
+  path: string;
+  parent: string | null;
+  entries: FsEntry[];
+};
+
 type AppSettings = {
   accounts: AccountProfile[];
   proxies: ProxyProfile[];
@@ -473,6 +483,11 @@ let roomPoll: number | null = null;
 // Destinataire choisi dans le composer : "" = diffusion salon, sinon ident d'un
 // agent (DM). Conserve entre les rendus complets.
 let roomComposeTarget = "";
+// Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
+let workspaceModalOpen = false;
+let workspaceBrowse: FsListResponse | null = null;
+let workspaceBrowseLoading = false;
+let workspaceBrowseError = "";
 
 const lucideIcons = {
   AppWindow,
@@ -508,6 +523,27 @@ const lucideIcons = {
 };
 
 const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
+
+// Workspace courant = dossier de travail (cwd) applique aux PROCHAINS agents.
+// Memorise par appareil (localStorage) : chaque navigateur/PC garde son propre
+// choix. En web c'est un dossier du serveur ; en desktop un dossier local.
+const WORKSPACE_STORAGE_KEY = "codex-switch-terminal.workspace.path";
+
+const currentWorkspace = (): string | null =>
+  localStorage.getItem(WORKSPACE_STORAGE_KEY)?.trim() || null;
+
+const setCurrentWorkspace = (path: string | null) => {
+  const trimmed = path?.trim();
+  if (trimmed) {
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
+  } else {
+    localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+  }
+};
+
+// Dernier segment d'un chemin (nom du dossier) pour un affichage compact.
+const workspaceBaseName = (path: string): string =>
+  path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
 
 const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -710,10 +746,11 @@ const agentRunCommand = (
 
 const agentIsIde = (agent: AgentProfile | null | undefined) => agent?.kind === "ide";
 
-// Dossier projet a ouvrir pour un agent IDE : celui du terminal actif, sinon
-// celui du compte selectionne.
+// Dossier projet a ouvrir pour un agent IDE / Kombai : le workspace choisi est
+// prioritaire (choix explicite global), sinon le dossier du terminal actif,
+// sinon celui du compte selectionne.
 const currentProjectDir = () =>
-  activeTerminal()?.projectDir ?? selectedAccount()?.projectDir?.trim() ?? null;
+  currentWorkspace() ?? activeTerminal()?.projectDir ?? selectedAccount()?.projectDir?.trim() ?? null;
 
 const launchIde = async (agent: AgentProfile, projectDir: string | null = currentProjectDir()) => {
   try {
@@ -1996,6 +2033,63 @@ const pickProjectDir = async () => {
   render();
 };
 
+// --- Selecteur de workspace ----------------------------------------------
+// Ouvre le choix du dossier de travail global. Desktop : dialogue natif.
+// Web : modale de navigation des dossiers du serveur (borne a la racine).
+const openWorkspacePicker = async () => {
+  if (isRemoteMode()) {
+    workspaceModalOpen = true;
+    workspaceBrowse = null;
+    workspaceBrowseError = "";
+    render();
+    await loadWorkspaceDir(currentWorkspace());
+    return;
+  }
+
+  try {
+    const picked = await invoke<string | null>("pick_project_dir", {
+      currentDir: currentWorkspace() ?? "",
+    });
+    if (picked) {
+      setCurrentWorkspace(picked);
+      statusText = `Workspace: ${picked}`;
+    } else {
+      statusText = "Selection annulee";
+    }
+  } catch (error) {
+    statusText = String(error);
+  }
+  render();
+};
+
+const loadWorkspaceDir = async (path: string | null) => {
+  workspaceBrowseLoading = true;
+  workspaceBrowseError = "";
+  render();
+  try {
+    workspaceBrowse = await invoke<FsListResponse>("list_dir", {
+      path: path ?? undefined,
+    });
+  } catch (error) {
+    workspaceBrowseError = String(error);
+    workspaceBrowse = null;
+  }
+  workspaceBrowseLoading = false;
+  render();
+};
+
+const closeWorkspaceModal = () => {
+  workspaceModalOpen = false;
+  render();
+};
+
+const chooseWorkspace = (path: string | null) => {
+  setCurrentWorkspace(path);
+  workspaceModalOpen = false;
+  statusText = path ? `Workspace: ${path}` : "Workspace retire";
+  render();
+};
+
 const createPoolTerminal = async () => {
   try {
     const picked = await invoke<AccountProfile>("pool_pick_terminal_account");
@@ -2090,6 +2184,11 @@ const render = () => {
     ? (activeSession?.proxySummary ?? (proxy ? maskProxy(proxy.proxyUrl) : "sans proxy"))
     : "proxy off";
   const contextProject = displayProjectDir(activeSession?.projectDir ?? account?.projectDir);
+  const workspacePath = currentWorkspace();
+  const workspaceChipLabel = workspacePath ? workspaceBaseName(workspacePath) : "Workspace";
+  const workspaceTitle = workspacePath
+    ? `Workspace des nouveaux agents: ${workspacePath}`
+    : "Aucun workspace: les nouveaux agents demarrent dans le dossier par defaut";
   const terminalCountLabel =
     terminalSessions.length === 1 ? "1 terminal" : `${terminalSessions.length} terminaux`;
   const terminalSideItems = terminalSessions
@@ -2160,6 +2259,17 @@ const render = () => {
             </div>
           </div>
           <div class="actions">
+            <div class="workspace-control" title="${escapeAttr(workspaceTitle)}">
+              <button id="workspacePick" class="tool-button ${workspacePath ? "primary" : ""}" title="${escapeAttr(workspaceTitle)}">
+                <i data-lucide="folder-open"></i>
+                <span>${escapeHtml(workspaceChipLabel)}</span>
+              </button>
+              ${workspacePath
+                ? `<button id="workspaceClear" class="icon-button" title="Retirer le workspace">
+                <i data-lucide="x"></i>
+              </button>`
+                : ""}
+            </div>
             <button id="fullscreenToggle" class="icon-button wide ${isFullscreen ? "active" : ""}" title="${isFullscreen ? "Quitter plein ecran (F11)" : "Plein ecran (F11)"}" aria-label="${isFullscreen ? "Quitter plein ecran" : "Plein ecran"}" aria-pressed="${isFullscreen}">
               <i data-lucide="${isFullscreen ? "minimize-2" : "maximize-2"}"></i>
             </button>
@@ -2250,6 +2360,7 @@ const render = () => {
     </div>
     ${renderNewTerminalModal()}
     ${renderAgentsModal()}
+    ${renderWorkspaceModal()}
   `;
 
   createIcons({ icons: lucideIcons });
@@ -2569,6 +2680,68 @@ const renderAgentsModal = () => {
           <button class="tool-button primary" id="saveAgentsModal">
             <i data-lucide="save"></i>
             <span>Enregistrer</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+  `;
+};
+
+const renderWorkspaceModal = () => {
+  if (!workspaceModalOpen) return "";
+
+  const data = workspaceBrowse;
+  const entries = data?.entries ?? [];
+  const list = entries
+    .map(
+      (entry) => `
+        <button class="ws-entry" data-ws-dir="${escapeAttr(entry.path)}" title="${escapeAttr(entry.path)}">
+          <i data-lucide="folder-open"></i>
+          <span>${escapeHtml(entry.name)}</span>
+        </button>`,
+    )
+    .join("");
+  const selected = currentWorkspace();
+
+  return `
+    <div class="modal-backdrop" id="workspaceBackdrop">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="workspaceModalTitle">
+        <header class="modal-head">
+          <div>
+            <h2 id="workspaceModalTitle">Choisir un workspace</h2>
+            <p>Dossier du serveur ou demarreront les prochains agents (cwd).</p>
+          </div>
+          <button class="icon-button" id="closeWorkspaceModal" title="Fermer">
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+
+        <div class="modal-body">
+          <div class="ws-path-row">
+            <input id="workspacePathInput" value="${escapeAttr(data?.path ?? "")}" placeholder="/chemin/vers/dossier" spellcheck="false" />
+            <button class="tool-button" id="workspaceGo" title="Aller a ce chemin">
+              <i data-lucide="search"></i>
+              <span>Aller</span>
+            </button>
+          </div>
+          ${selected ? `<div class="ws-current">Workspace actuel : <strong>${escapeHtml(selected)}</strong></div>` : ""}
+          ${data?.parent
+            ? `<button class="ws-entry ws-parent" data-ws-dir="${escapeAttr(data.parent)}" title="${escapeAttr(data.parent)}">
+                 <i data-lucide="folder-open"></i>
+                 <span>.. (dossier parent)</span>
+               </button>`
+            : ""}
+          ${workspaceBrowseLoading ? `<div class="ws-hint">Chargement...</div>` : ""}
+          ${workspaceBrowseError ? `<div class="ws-error">${escapeHtml(workspaceBrowseError)}</div>` : ""}
+          <div class="ws-list">${list || (workspaceBrowseLoading ? "" : `<div class="empty">Aucun sous-dossier</div>`)}</div>
+        </div>
+
+        <footer class="modal-actions">
+          <button class="tool-button" id="cancelWorkspaceModal">Annuler</button>
+          <button class="tool-button" id="clearWorkspaceModal">Aucun workspace</button>
+          <button class="tool-button primary" id="confirmWorkspaceModal" ${data?.path ? "" : "disabled"}>
+            <i data-lucide="badge-check"></i>
+            <span>Choisir ce dossier</span>
           </button>
         </footer>
       </section>
@@ -2982,10 +3155,7 @@ const renderDashboardPanel = () => {
         ${renderUsageAreaChart(chartDays)}
       </section>
 
-      <div class="dashboard-tabs">
-        <button class="active">Resume</button>
-        <button>Agents <span>${dash.totalAgentRuns}</span></button>
-        <button>API <span>${dash.totalApiRequests}</span></button>
+      <div class="dashboard-table-toolbar">
         <div class="dashboard-table-actions">
           <button id="dashboardRefresh"><i data-lucide="refresh-ccw"></i><span>Actualiser</span></button>
         </div>
@@ -3494,6 +3664,57 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#pickProjectDir")?.addEventListener("click", () => {
     void pickProjectDir();
+  });
+
+  document.querySelector<HTMLButtonElement>("#workspacePick")?.addEventListener("click", () => {
+    void openWorkspacePicker();
+  });
+
+  document.querySelector<HTMLButtonElement>("#workspaceClear")?.addEventListener("click", () => {
+    chooseWorkspace(null);
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-ws-dir]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const path = button.dataset.wsDir;
+      if (path) void loadWorkspaceDir(path);
+    });
+  });
+
+  document.querySelector<HTMLButtonElement>("#workspaceGo")?.addEventListener("click", () => {
+    const value = document.querySelector<HTMLInputElement>("#workspacePathInput")?.value.trim();
+    void loadWorkspaceDir(value || null);
+  });
+
+  document.querySelector<HTMLInputElement>("#workspacePathInput")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const value = (event.currentTarget as HTMLInputElement).value.trim();
+      void loadWorkspaceDir(value || null);
+    }
+  });
+
+  document.querySelector<HTMLButtonElement>("#confirmWorkspaceModal")?.addEventListener("click", () => {
+    const path = workspaceBrowse?.path?.trim();
+    if (path) chooseWorkspace(path);
+  });
+
+  document.querySelector<HTMLButtonElement>("#clearWorkspaceModal")?.addEventListener("click", () => {
+    chooseWorkspace(null);
+  });
+
+  document.querySelector<HTMLButtonElement>("#cancelWorkspaceModal")?.addEventListener("click", () => {
+    closeWorkspaceModal();
+  });
+
+  document.querySelector<HTMLButtonElement>("#closeWorkspaceModal")?.addEventListener("click", () => {
+    closeWorkspaceModal();
+  });
+
+  document.querySelector<HTMLDivElement>("#workspaceBackdrop")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeWorkspaceModal();
+    }
   });
 
   document.querySelector<HTMLButtonElement>("#newTerminal")?.addEventListener("click", () => {
@@ -4050,10 +4271,17 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
       : null;
 
   try {
+    // Workspace choisi (dossier de travail global) :
+    //  - web  : envoye au serveur comme `workspacePath` (cwd = ce dossier ; le
+    //           serveur ignore alors `repoUrl`) ;
+    //  - desktop : envoye comme `projectDir` (override du dossier du compte).
+    const workspace = currentWorkspace();
     const ptyId = await invoke<number>("start_terminal", {
       id: requestedId,
       accountId: session.accountId,
       repoUrl: isRemoteMode() ? session.projectDir ?? "" : undefined,
+      workspacePath: isRemoteMode() ? workspace ?? undefined : undefined,
+      projectDir: !isRemoteMode() ? workspace ?? undefined : undefined,
       branch: null,
       cols: session.terminal.cols,
       rows: session.terminal.rows,
@@ -4065,7 +4293,10 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
     session.status = "Actif";
     statusText = "Terminal actif";
     if (settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
-      void launchIde(sessionAgent, session.projectDir);
+      // Cohérent avec le terminal (cwd = workspace choisi) et avec le lancement
+      // manuel : currentProjectDir() priorise le workspace, sinon le dossier du
+      // terminal/compte. Sans ça, l'IDE s'ouvrirait sur le dossier du compte.
+      void launchIde(sessionAgent, currentProjectDir());
     }
     persistTerminalSessions();
     const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;

@@ -237,6 +237,11 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return pickRemotePoolAccount<T>();
     case "start_terminal":
       return startRemoteTerminal<T>(args);
+    case "list_dir":
+      return api<T>(
+        "GET",
+        `/api/fs/list${args.path ? `?path=${encodeURIComponent(String(args.path))}` : ""}`,
+      );
     case "write_terminal":
       writeRemoteTerminal(args.id, args.data);
       return undefined as T;
@@ -472,6 +477,7 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
     id: args.id,
     accountId: args.accountId,
     repoUrl: args.repoUrl,
+    workspacePath: args.workspacePath,
     branch: args.branch,
     cols: args.cols,
     rows: args.rows,

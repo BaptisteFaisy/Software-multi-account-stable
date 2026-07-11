@@ -71,6 +71,7 @@ pub fn start_terminal(
     cols: u16,
     rows: u16,
     command: Option<String>,
+    project_dir: Option<String>,
 ) -> Result<u64, String> {
     let settings = load_settings_for_terminal()?;
     let account = settings
@@ -106,7 +107,23 @@ pub fn start_terminal(
         }
     }
 
-    let project_dir = resolve_project_dir(&account)?;
+    // Workspace choisi dans l'UI (dossier de travail global) : prioritaire sur le
+    // `project_dir` par defaut du compte. Sinon, on retombe sur le comportement
+    // historique (dossier projet du compte).
+    let project_dir = match project_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => {
+            let path = expand_home(raw)?;
+            if !path.is_dir() {
+                return Err(format!("Dossier workspace introuvable: {raw}"));
+            }
+            Some(path)
+        }
+        None => resolve_project_dir(&account)?,
+    };
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system

@@ -64,6 +64,12 @@ pub struct ServerConfig {
     node_id: String,
     node_label: String,
     node_capacity: usize,
+    /// Racine autorisee pour le navigateur de dossiers et les workspaces
+    /// pointant un dossier EXISTANT (`workspacePath`). Definie via
+    /// `CST_WORKSPACES_ROOT` (defaut : dossier personnel). Toute navigation ou
+    /// selection en dehors de cette racine est refusee. Stockee sous forme
+    /// canonique pour une comparaison de prefixe fiable.
+    workspaces_root: PathBuf,
 }
 
 #[derive(Clone)]
@@ -86,7 +92,14 @@ struct ServerState {
 struct StartTerminalRequest {
     id: Option<u64>,
     account_id: String,
-    repo_url: String,
+    /// Depot git a cloner dans un workspace EPHEMERE (purge 7j). Optionnel :
+    /// ignore si `workspace_path` est fourni.
+    #[serde(default)]
+    repo_url: Option<String>,
+    /// Dossier EXISTANT sur le serveur (dans la racine autorisee) a utiliser
+    /// directement comme cwd. Prioritaire sur `repo_url` ; jamais clone ni purge.
+    #[serde(default)]
+    workspace_path: Option<String>,
     branch: Option<String>,
     cols: u16,
     rows: u16,
@@ -204,6 +217,31 @@ struct WorkspaceView {
     retained_until: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsListResponse {
+    /// Racine autorisee (borne haute de navigation).
+    root: String,
+    /// Dossier courant liste.
+    path: String,
+    /// Dossier parent, ou `null` si `path` est deja la racine.
+    parent: Option<String>,
+    entries: Vec<FsEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FsListQuery {
+    path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ServerWsMessage {
@@ -307,16 +345,36 @@ impl RemoteTerminalManager {
         let id = request
             .id
             .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
-        let workspace_id = format!("{id}-{}", Uuid::new_v4().simple());
-        let workspace_root = config.data_dir.join("workspaces").join(&workspace_id);
-        let repo_dir = workspace_root.join("repo");
-        let repo_label = prepare_workspace(
-            &request.repo_url,
-            request.branch.as_deref(),
-            &repo_dir,
-            &config.git_pat,
-        )
-        .map_err(|error| redact_secrets(&error, config))?;
+
+        // Deux facons de fixer le repertoire de travail :
+        //  - `workspace_path` : un DOSSIER EXISTANT du serveur (dans la racine
+        //    autorisee). Utilise tel quel comme cwd ; jamais clone ni purge.
+        //  - `repo_url` : un depot git clone dans un workspace EPHEMERE
+        //    (`data_dir/workspaces/<id>`, purge auto au bout de 7j).
+        let selected_workspace = request
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        let (repo_dir, workspace_id, repo_label) = if let Some(raw) = selected_workspace {
+            let dir = resolve_within_root(&config.workspaces_root, raw)?;
+            let workspace_id = workspace_id_for_dir(&dir);
+            let label = display_path(&dir);
+            (dir, workspace_id, label)
+        } else {
+            let workspace_id = format!("{id}-{}", Uuid::new_v4().simple());
+            let workspace_root = config.data_dir.join("workspaces").join(&workspace_id);
+            let repo_dir = workspace_root.join("repo");
+            let label = prepare_workspace(
+                request.repo_url.as_deref().unwrap_or(""),
+                request.branch.as_deref(),
+                &repo_dir,
+                &config.git_pat,
+            )
+            .map_err(|error| redact_secrets(&error, config))?;
+            (repo_dir, workspace_id, label)
+        };
 
         let codex_home = settings::expand_home(&account.codex_home)?;
         fs::create_dir_all(&codex_home).map_err(|error| error.to_string())?;
@@ -611,6 +669,7 @@ pub async fn run_from_env() -> Result<(), String> {
         )
         .route("/workspaces", get(api_workspaces))
         .route("/workspaces/:id", delete(api_delete_workspace))
+        .route("/fs/list", get(api_fs_list))
         .route("/room/status", get(api_room_status))
         .route("/room/messages", get(api_room_messages))
         .route("/room/send", post(api_room_send))
@@ -722,6 +781,7 @@ impl ServerConfig {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or_else(default_node_capacity);
+        let workspaces_root = resolve_workspaces_root(&data_dir);
         Ok(ServerConfig {
             bind,
             data_dir,
@@ -732,6 +792,7 @@ impl ServerConfig {
             node_id,
             node_label,
             node_capacity,
+            workspaces_root,
         })
     }
 }
@@ -757,6 +818,113 @@ fn default_static_dir() -> PathBuf {
         .ok()
         .and_then(|cwd| cwd.parent().map(|parent| parent.join("dist")))
         .unwrap_or_else(|| PathBuf::from("dist"))
+}
+
+/// Racine du navigateur de dossiers / des workspaces "dossier existant".
+/// Priorite : `CST_WORKSPACES_ROOT`, puis le dossier personnel
+/// (`USERPROFILE`/`HOME`), puis le repertoire de donnees. Le dossier est cree si
+/// besoin, puis canonicalise (best-effort) pour permettre une comparaison de
+/// prefixe fiable lors de la validation des chemins.
+fn resolve_workspaces_root(data_dir: &Path) -> PathBuf {
+    let root = std::env::var_os("CST_WORKSPACES_ROOT")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| data_dir.to_path_buf());
+    let _ = fs::create_dir_all(&root);
+    fs::canonicalize(&root).unwrap_or(root)
+}
+
+/// Retire le prefixe Windows de chemin etendu (`\\?\`) pour un affichage propre
+/// et un `cwd` utilisable. No-op sur les autres plateformes.
+fn strip_extended_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix("UNC\\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn display_path(path: &Path) -> String {
+    strip_extended_prefix(path).to_string_lossy().to_string()
+}
+
+/// Valide qu'un chemin demande (absolu, ou relatif a la racine) existe, est un
+/// dossier, et se situe A L'INTERIEUR de la racine autorisee. Empeche les
+/// echappements par `..` et par lien symbolique (grace a la canonicalisation).
+/// Renvoie le chemin canonique nettoye (sans prefixe `\\?\`).
+fn resolve_within_root(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Ok(strip_extended_prefix(root));
+    }
+    let candidate = {
+        let path = Path::new(requested);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        }
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|_| format!("dossier introuvable: {requested}"))?;
+    // Comparaison sur les formes nettoyees pour eviter tout desaccord de prefixe
+    // (`\\?\`) entre la racine et le candidat.
+    let root_norm = strip_extended_prefix(root);
+    let canonical_norm = strip_extended_prefix(&canonical);
+    if !canonical_norm.starts_with(&root_norm) {
+        return Err("dossier hors de la racine autorisee".to_string());
+    }
+    if !canonical_norm.is_dir() {
+        return Err(format!("pas un dossier: {requested}"));
+    }
+    Ok(canonical_norm)
+}
+
+/// Liste UNIQUEMENT les sous-dossiers d'un repertoire (pour un selecteur de
+/// dossier), tries par nom (insensible a la casse). Les fichiers sont ignores.
+fn list_subdirs(dir: &Path) -> Result<Vec<FsEntry>, String> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map(|file_type| file_type.is_dir())
+            .unwrap_or_else(|_| path.is_dir());
+        if !is_dir {
+            continue;
+        }
+        entries.push(FsEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            path: display_path(&path),
+            is_dir: true,
+        });
+    }
+    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(entries)
+}
+
+/// Identifiant stable (sans separateur de chemin) pour un workspace pointant un
+/// dossier existant. Sert d'etiquette de routage ; n'est jamais utilise pour
+/// supprimer quoi que ce soit (la purge ne touche que `data_dir/workspaces`).
+fn workspace_id_for_dir(dir: &Path) -> String {
+    let mut id = String::from("dir-");
+    for character in dir.to_string_lossy().chars() {
+        if character.is_ascii_alphanumeric() {
+            id.push(character.to_ascii_lowercase());
+        } else if !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    id.trim_end_matches('-').chars().take(96).collect()
 }
 
 async fn api_healthz(State(state): State<Arc<ServerState>>) -> Response {
@@ -1128,6 +1296,37 @@ async fn api_delete_workspace(
     auth_or(&state, &headers, || {
         delete_workspace(&state.config.data_dir, &id)?;
         Ok(json_response(json!({ "ok": true })))
+    })
+}
+
+/// Navigateur de dossiers borne a la racine autorisee (`workspaces_root`).
+/// Renvoie uniquement les sous-dossiers, plus le parent (sauf a la racine). Sert
+/// au selecteur de workspace cote web.
+async fn api_fs_list(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<FsListQuery>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        let root = &state.config.workspaces_root;
+        let dir = match query.path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            Some(path) => resolve_within_root(root, path)?,
+            None => strip_extended_prefix(root),
+        };
+        let root_display = display_path(root);
+        let dir_display = dir.to_string_lossy().to_string();
+        let parent = if dir_display == root_display {
+            None
+        } else {
+            dir.parent().map(|parent| parent.to_string_lossy().to_string())
+        };
+        let entries = list_subdirs(&dir)?;
+        Ok(json_response(FsListResponse {
+            root: root_display,
+            path: dir_display,
+            parent,
+            entries,
+        }))
     })
 }
 
@@ -1581,5 +1780,59 @@ mod tests {
             }
             other => panic!("unexpected terminal event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_within_root_confines_to_root() {
+        // Racine reelle sous le repertoire temporaire, canonicalisee comme le
+        // fait `resolve_workspaces_root` en production.
+        let uid = format!("{}-{:p}", std::process::id(), &0u8 as *const u8);
+        let base = std::env::temp_dir().join(format!("cst-ws-root-{uid}"));
+        let child = base.join("projects").join("alpha");
+        fs::create_dir_all(&child).expect("create child dir");
+        let outside = std::env::temp_dir().join(format!("cst-ws-out-{uid}"));
+        fs::create_dir_all(&outside).expect("create outside dir");
+        let root = fs::canonicalize(&base).expect("canonicalize root");
+
+        // Chemin absolu valide dans la racine.
+        let resolved = resolve_within_root(&root, &child.to_string_lossy())
+            .expect("child abs path must resolve");
+        assert!(resolved.ends_with("alpha"));
+
+        // Chemin relatif a la racine.
+        let rel = resolve_within_root(&root, "projects/alpha").expect("relative path must resolve");
+        assert!(rel.ends_with("alpha"));
+
+        // Chemin vide -> racine elle-meme.
+        let root_resolved = resolve_within_root(&root, "  ").expect("empty resolves to root");
+        assert_eq!(root_resolved, strip_extended_prefix(&root));
+
+        // Echappement par `..` vers un dossier hors racine : refuse.
+        let escape = base.join("..").join(outside.file_name().unwrap());
+        assert!(
+            resolve_within_root(&root, &escape.to_string_lossy()).is_err(),
+            "path traversal via .. must be rejected"
+        );
+
+        // Dossier existant mais hors de la racine : refuse.
+        assert!(
+            resolve_within_root(&root, &outside.to_string_lossy()).is_err(),
+            "absolute path outside root must be rejected"
+        );
+
+        // Chemin inexistant : refuse.
+        assert!(resolve_within_root(&root, "does/not/exist").is_err());
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn workspace_id_for_dir_has_no_path_separators() {
+        let id = workspace_id_for_dir(Path::new("/home/user/My Projects/app"));
+        assert!(id.starts_with("dir-"));
+        assert!(!id.contains('/'));
+        assert!(!id.contains('\\'));
+        assert!(!id.contains(' '));
     }
 }
