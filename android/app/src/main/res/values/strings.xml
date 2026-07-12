@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Codex Terminal</string>
+    <!-- Serveur par defaut (Tailscale Serve, HTTPS tailnet). Modifiable ensuite
+         via l'ecran de connexion web ou le pont CstAndroid.setConfig(). -->
+    <string name="server_url">https://pc-fixe-cst.tail3a8bdf.ts.net</string>
+</resources>

@@ -1,0 +1,17 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#111111"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Chevron ">" facon prompt terminal -->
+    <path
+        android:fillColor="#FFD166"
+        android:pathData="M33,36 l22,18 l-22,18 l7,7 l29,-25 l-29,-25 z" />
+    <!-- Barre "_" du curseur -->
+    <path
+        android:fillColor="#FFD166"
+        android:pathData="M60,72 h20 v9 h-20 z" />
+</vector>

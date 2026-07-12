@@ -1,16 +1,16 @@
-//! **Agent Room** — un salon de communication inter-agents.
+//! **Workspace Collaboration** — communication inter-agents cloisonnee par workspace.
 //!
-//! Chaque terminal lance un agent Codex isole (un PTY, un `CODEX_HOME` par
-//! compte). Ce module expose un petit **serveur MCP en HTTP streamable** que
-//! tous les agents rejoignent (via une entree `[mcp_servers.agent_room]` dans
+//! Chaque terminal/chat lance un agent isole (worktree + home provider propres).
+//! Ce module expose un petit **serveur MCP en HTTP streamable** que
+//! les agents rejoignent (via une entree `[mcp_servers.workspace_collab]` dans
 //! leur `config.toml`, cf. `codex mcp add`). Les agents peuvent alors :
 //! - se voir (`list_agents`, `whoami`),
-//! - poster dans le salon commun (`send_message`),
+//! - poster dans le salon de leur workspace (`send_message`),
 //! - s'envoyer des messages prives (`send_message` avec `to`),
 //! - lire ce qui les concerne (`read_messages`, `wait_for_messages`).
 //!
-//! IDENTITE / AUTH : `config.toml` est PAR HOME (partage entre terminaux d'un
-//! meme compte), mais la valeur du bearer token est lue dans une variable
+//! IDENTITE / AUTH : chaque home est propre a un agent et la valeur du bearer
+//! token est lue dans une variable
 //! d'environnement du process au runtime (`bearer_token_env_var`). L'app injecte
 //! donc un `CST_ROOM_TOKEN` UNIQUE par PTY ; le serveur mappe token -> agent, ce
 //! qui distingue deux terminaux d'un meme compte. Un token inconnu => 401.
@@ -24,6 +24,11 @@
 //! `tools/list`, `tools/call`. Pas de SSE cote serveur (les reponses tiennent en
 //! une requete), donc pas de dependance MCP externe.
 
+use crate::{
+    merge_queue::{MergeQueue, MergeQueueSnapshot, MergeStatus},
+    settings::Provider,
+    worktree::MergeContext,
+};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -35,14 +40,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Write as _},
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -52,6 +57,9 @@ use tokio::sync::broadcast;
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Identite reservee de l'operateur humain (l'UI de l'app).
 pub const OPERATOR_IDENT: &str = "operator";
+/// Scope de compatibilite pour les appels/tests qui ne precisent pas encore de
+/// workspace. Les agents de production recoivent toujours un scope opaque.
+pub const DEFAULT_ROOM_ID: &str = "default";
 /// Longueur max d'un message (framing / anti-abus).
 const MESSAGE_MAX_CHARS: usize = 8000;
 /// Rate-limit par agent (token-bucket) : capacite et recharge par seconde.
@@ -62,12 +70,31 @@ const WAIT_DEFAULT_MS: u64 = 25_000;
 const WAIT_MAX_MS: u64 = 55_000;
 /// Nom du fichier journal persiste.
 const LOG_FILE: &str = "messages.jsonl";
+const LOG_MEMORY_MAX: usize = 20_000;
+const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+const LOG_SEGMENTS_MAX: usize = 8;
+const AGENT_HISTORY_MAX: usize = 2_000;
+const COLLAB_MCP_NAME: &str = "workspace_collab";
+const LEGACY_MCP_NAME: &str = "agent_room";
 
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn default_room_id() -> String {
+    DEFAULT_ROOM_ID.to_string()
+}
+
+fn normalize_room_id(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        DEFAULT_ROOM_ID.to_string()
+    } else {
+        value.chars().take(160).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -79,9 +106,16 @@ fn now_ts() -> i64 {
 #[derive(Debug, Clone, Default)]
 pub struct AgentMeta {
     pub agent_id: String,
+    /// Fournisseur CLI de l'agent (Codex / Claude). Permet au salon de
+    /// distinguer des pairs de providers differents.
+    pub provider: Provider,
     pub account_id: String,
     pub label: String,
     pub cwd: Option<String>,
+    pub workspace_id: Option<String>,
+    /// Salon logique stable partage par tous les worktrees d'un meme workspace.
+    pub room_id: String,
+    pub merge_context: Option<MergeContext>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,9 +127,13 @@ pub struct AgentInfo {
     pub account_id: String,
     pub label: String,
     pub cwd: Option<String>,
+    pub workspace_id: Option<String>,
+    pub room_id: String,
     pub present: bool,
     pub joined_at: i64,
     pub last_seen: i64,
+    #[serde(skip)]
+    pub(crate) merge_context: Option<MergeContext>,
     // Etat du token-bucket d'envoi (jamais serialise ni expose).
     #[serde(skip)]
     send_tokens: f64,
@@ -119,6 +157,8 @@ pub enum MsgKind {
 pub struct RoomMessage {
     pub id: u64,
     pub ts: i64,
+    #[serde(default = "default_room_id")]
+    pub room_id: String,
     /// Ident public de l'emetteur.
     pub from: String,
     pub from_label: String,
@@ -132,10 +172,14 @@ pub struct RoomMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomSnapshot {
+    pub room_id: String,
     pub agents: Vec<AgentInfo>,
     pub present: usize,
     pub total_messages: usize,
     pub cursor: u64,
+    pub oldest_cursor: u64,
+    pub coordination: MergeQueueSnapshot,
+    pub store_owner: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +196,9 @@ struct RoomInner {
     agents: Mutex<HashMap<String, AgentInfo>>,
     /// Journal ordonne de tous les messages (salon + DM + systeme).
     log: Mutex<Vec<RoomMessage>>,
+    /// Dernier curseur effectivement remis a chaque ident (observabilite et
+    /// base d'une reprise sans rescanner l'historique complet).
+    read_cursors: Mutex<HashMap<String, u64>>,
     next_id: AtomicU64,
     ident_seq: AtomicU64,
     /// Notifie l'id du dernier message poste (pour le long-poll wait_for_messages).
@@ -164,32 +211,68 @@ struct RoomInner {
     data_dir: Option<PathBuf>,
     /// Serialise les ecritures dans le journal JSONL.
     io_lock: Mutex<()>,
-    /// CODEX_HOME deja provisionnes cette session (evite de rappeler
-    /// `codex mcp get/add` a chaque lancement de terminal).
-    provisioned: Mutex<HashSet<String>>,
+    /// Provisioning single-flight par (provider, home). Deux lancements du meme
+    /// home attendent le meme resultat ; des homes differents avancent en
+    /// parallele.
+    provisioned: Mutex<HashMap<String, Arc<ProvisionSlot>>>,
+    merge_queue: MergeQueue,
+    /// Ownership cross-process du store persiste.
+    _owner_lock: Option<crate::fs_util::ProcessFileLock>,
+}
+
+struct ProvisionSlot {
+    result: Mutex<Option<Result<(), String>>>,
+    ready: Condvar,
+}
+
+impl ProvisionSlot {
+    fn pending() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
 }
 
 impl RoomState {
     /// Salon en memoire seule (tests / usage transitoire).
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(None, None)
     }
 
     /// Salon persiste dans `<dir>/messages.jsonl` (honore `CST_DATA_DIR` cote
     /// appelant). Recharge l'historique existant et reprend la numerotation.
     pub fn with_data_dir(dir: PathBuf) -> Self {
         let _ = fs::create_dir_all(&dir);
-        let state = Self::build(Some(dir));
+        let owner = match crate::fs_util::try_process_lock(&dir.join(".owner.lock")) {
+            Ok(owner) => owner,
+            Err(error) => {
+                eprintln!(
+                    "[workspace_collab] store deja possede par un autre processus ({}): {error}; repli memoire seule",
+                    dir.display()
+                );
+                return Self::build(None, None);
+            }
+        };
+        let state = Self::build(Some(dir), Some(owner));
         state.load_log();
         state
     }
 
-    fn build(data_dir: Option<PathBuf>) -> Self {
+    fn build(
+        data_dir: Option<PathBuf>,
+        owner_lock: Option<crate::fs_util::ProcessFileLock>,
+    ) -> Self {
         let (notify, _rx) = broadcast::channel(256);
-        RoomState {
+        let merge_queue = data_dir
+            .as_ref()
+            .map(|dir| MergeQueue::with_data_dir(dir.join("merge-queue")))
+            .unwrap_or_default();
+        let state = RoomState {
             inner: Arc::new(RoomInner {
                 agents: Mutex::new(HashMap::new()),
                 log: Mutex::new(Vec::new()),
+                read_cursors: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 ident_seq: AtomicU64::new(1),
                 notify,
@@ -197,38 +280,125 @@ impl RoomState {
                 tools_list_count: AtomicU64::new(0),
                 data_dir,
                 io_lock: Mutex::new(()),
-                provisioned: Mutex::new(HashSet::new()),
+                provisioned: Mutex::new(HashMap::new()),
+                merge_queue: merge_queue.clone(),
+                _owner_lock: owner_lock,
             }),
-        }
+        };
+        let weak = Arc::downgrade(&state.inner);
+        merge_queue.set_notifier(Arc::new(move |event| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let room = RoomState { inner };
+            let text = match event.status {
+                MergeStatus::Landed => format!(
+                    "landed merge #{} sur {}: nouvelle base CST_BASE_SHA={} (base soumise {})",
+                    event.id,
+                    event.target_ref,
+                    event.landed_sha.as_deref().unwrap_or("inconnu"),
+                    event.base_sha
+                ),
+                MergeStatus::Conflict => format!(
+                    "merge #{} en conflit: {}",
+                    event.id,
+                    event.conflicts.join(", ")
+                ),
+                MergeStatus::VerifyFailed => format!("merge #{} refuse par verify", event.id),
+                MergeStatus::Failed => format!("merge #{} en echec", event.id),
+                _ => return,
+            };
+            room.post_in_room(
+                &event.room_id,
+                "merge-queue",
+                "Merge Queue",
+                None,
+                MsgKind::System,
+                text,
+            );
+        }));
+        state
     }
 
     /// Provisionne un `CODEX_HOME` (idempotent, avec cache par session) : ajoute
-    /// l'entree `[mcp_servers.agent_room]` via `codex mcp add` si absente.
-    pub fn provision_home(&self, codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), String> {
-        let key = codex_home.to_string_lossy().to_lowercase();
-        if self
-            .inner
-            .provisioned
+    /// l'entree `[mcp_servers.workspace_collab]` via `codex mcp add` si absente.
+    pub fn provision_home(
+        &self,
+        provider: Provider,
+        cli_bin: &str,
+        home: &Path,
+        url: &str,
+    ) -> Result<(), String> {
+        // Cle de cache = (provider, home) : Codex et Claude ecrivent des configs
+        // differentes, et leurs homes sont de toute facon distincts.
+        let key = format!(
+            "{}:{}",
+            provider.as_str(),
+            home.to_string_lossy().to_lowercase()
+        );
+        let (slot, leader) = {
+            let mut slots = self
+                .inner
+                .provisioned
+                .lock()
+                .map_err(|_| "cache de provisioning verrouille".to_string())?;
+            if let Some(slot) = slots.get(&key) {
+                (slot.clone(), false)
+            } else {
+                let slot = Arc::new(ProvisionSlot::pending());
+                slots.insert(key.clone(), slot.clone());
+                (slot, true)
+            }
+        };
+
+        if leader {
+            let result = provision(provider, cli_bin, home, url);
+            if let Ok(mut state) = slot.result.lock() {
+                *state = Some(result.clone());
+                slot.ready.notify_all();
+            }
+            // Un echec reste visible aux waiters deja attaches, mais est retire
+            // du registre afin qu'un prochain lancement puisse retenter.
+            if result.is_err() {
+                if let Ok(mut slots) = self.inner.provisioned.lock() {
+                    if slots
+                        .get(&key)
+                        .is_some_and(|known| Arc::ptr_eq(known, &slot))
+                    {
+                        slots.remove(&key);
+                    }
+                }
+            }
+            return result;
+        }
+
+        let mut state = slot
+            .result
             .lock()
-            .map(|set| set.contains(&key))
-            .unwrap_or(false)
-        {
-            return Ok(());
+            .map_err(|_| "provisioning verrouille".to_string())?;
+        while state.is_none() {
+            state = slot
+                .ready
+                .wait(state)
+                .map_err(|_| "provisioning verrouille".to_string())?;
         }
-        provision(codex_bin, codex_home, url)?;
-        if let Ok(mut set) = self.inner.provisioned.lock() {
-            set.insert(key);
-        }
-        Ok(())
+        state
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Err("provisioning termine sans resultat".to_string()))
     }
 
-    /// Retire l'entree du salon d'un `CODEX_HOME` et oublie le cache associe.
-    pub fn deprovision_home(&self, codex_bin: &str, codex_home: &Path) {
-        deprovision(codex_bin, codex_home);
-        let key = codex_home.to_string_lossy().to_lowercase();
-        if let Ok(mut set) = self.inner.provisioned.lock() {
-            set.remove(&key);
+    /// Retire l'entree du salon d'un home de compte et oublie le cache associe.
+    pub fn deprovision_home(&self, provider: Provider, cli_bin: &str, home: &Path) {
+        let key = format!(
+            "{}:{}",
+            provider.as_str(),
+            home.to_string_lossy().to_lowercase()
+        );
+        if let Ok(mut slots) = self.inner.provisioned.lock() {
+            slots.remove(&key);
         }
+        deprovision(provider, cli_bin, home);
     }
 
     fn log_path(&self) -> Option<PathBuf> {
@@ -239,19 +409,31 @@ impl RoomState {
     /// positionne `next_id` juste apres le plus grand id vu.
     fn load_log(&self) {
         let Some(path) = self.log_path() else { return };
-        let Ok(file) = fs::File::open(&path) else { return };
-        let reader = BufReader::new(file);
+        let mut paths = self.log_segment_paths();
+        if path.is_file() {
+            paths.push(path);
+        }
         let mut max_id = 0_u64;
         let mut restored = Vec::new();
-        for line in reader.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+        for path in paths {
+            let Ok(file) = fs::File::open(path) else {
                 continue;
+            };
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(message) = serde_json::from_str::<RoomMessage>(trimmed) {
+                    max_id = max_id.max(message.id);
+                    restored.push(message);
+                }
             }
-            if let Ok(message) = serde_json::from_str::<RoomMessage>(trimmed) {
-                max_id = max_id.max(message.id);
-                restored.push(message);
-            }
+        }
+        restored.sort_by_key(|message| message.id);
+        restored.dedup_by_key(|message| message.id);
+        if restored.len() > LOG_MEMORY_MAX {
+            restored.drain(..restored.len() - LOG_MEMORY_MAX);
         }
         if let Ok(mut log) = self.inner.log.lock() {
             *log = restored;
@@ -266,8 +448,48 @@ impl RoomState {
             return;
         };
         let _guard = self.inner.io_lock.lock();
+        if path.metadata().map(|meta| meta.len()).unwrap_or(0) >= LOG_ROTATE_BYTES {
+            self.rotate_log(&path);
+        }
         if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn log_segment_paths(&self) -> Vec<PathBuf> {
+        let Some(dir) = self.inner.data_dir.as_ref() else {
+            return Vec::new();
+        };
+        let mut paths = fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("messages-") && name.ends_with(".jsonl"))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    fn rotate_log(&self, path: &Path) {
+        let Some(dir) = path.parent() else { return };
+        let segment = dir.join(format!(
+            "messages-{:020}-{}.jsonl",
+            self.cursor(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        if fs::rename(path, segment).is_err() {
+            return;
+        }
+        let segments = self.log_segment_paths();
+        let excess = segments.len().saturating_sub(LOG_SEGMENTS_MAX);
+        for old in segments.into_iter().take(excess) {
+            let _ = fs::remove_file(old);
         }
     }
 
@@ -285,6 +507,7 @@ impl RoomState {
         let token = format!("agt_{}", uuid::Uuid::new_v4().simple());
         let ident = self.next_ident(&meta.label);
         let now = now_ts();
+        let room_id = normalize_room_id(&meta.room_id);
         let info = AgentInfo {
             ident: ident.clone(),
             agent_id: meta.agent_id,
@@ -295,17 +518,39 @@ impl RoomState {
                 meta.label
             },
             cwd: meta.cwd,
+            workspace_id: meta.workspace_id,
+            room_id: room_id.clone(),
             present: true,
             joined_at: now,
             last_seen: now,
+            merge_context: meta.merge_context,
             send_tokens: SEND_BUCKET_CAPACITY,
             bucket_refilled_at: now,
         };
         let label = info.label.clone();
         if let Ok(mut agents) = self.inner.agents.lock() {
             agents.insert(token.clone(), info);
+            if agents.len() > AGENT_HISTORY_MAX {
+                let mut departed = agents
+                    .iter()
+                    .filter(|(_, agent)| !agent.present)
+                    .map(|(token, agent)| (token.clone(), agent.last_seen))
+                    .collect::<Vec<_>>();
+                departed.sort_by_key(|(_, last_seen)| *last_seen);
+                let remove = agents.len().saturating_sub(AGENT_HISTORY_MAX);
+                for (token, _) in departed.into_iter().take(remove) {
+                    agents.remove(&token);
+                }
+            }
         }
-        self.post(&ident, &label, None, MsgKind::System, format!("{label} a rejoint le salon"));
+        self.post_in_room(
+            &room_id,
+            &ident,
+            &label,
+            None,
+            MsgKind::System,
+            format!("{label} a rejoint le dossier"),
+        );
         token
     }
 
@@ -316,15 +561,22 @@ impl RoomState {
                 Some(info) if info.present => {
                     info.present = false;
                     info.last_seen = now_ts();
-                    Some((info.ident.clone(), info.label.clone()))
+                    Some((info.room_id.clone(), info.ident.clone(), info.label.clone()))
                 }
                 _ => None,
             }
         } else {
             None
         };
-        if let Some((ident, label)) = departed {
-            self.post(&ident, &label, None, MsgKind::System, format!("{label} a quitte le salon"));
+        if let Some((room_id, ident, label)) = departed {
+            self.post_in_room(
+                &room_id,
+                &ident,
+                &label,
+                None,
+                MsgKind::System,
+                format!("{label} a quitte le dossier"),
+            );
         }
     }
 
@@ -332,6 +584,9 @@ impl RoomState {
     pub fn lookup(&self, token: &str) -> Option<AgentInfo> {
         let mut agents = self.inner.agents.lock().ok()?;
         let info = agents.get_mut(token)?;
+        if !info.present {
+            return None;
+        }
         info.last_seen = now_ts();
         Some(info.clone())
     }
@@ -361,23 +616,38 @@ impl RoomState {
 
     /// Vrai si un ident public correspond a un agent connu (pour valider un `to`).
     pub fn ident_exists(&self, ident: &str) -> bool {
+        self.ident_exists_in_room(DEFAULT_ROOM_ID, ident)
+    }
+
+    pub fn ident_exists_in_room(&self, room_id: &str, ident: &str) -> bool {
         if ident == OPERATOR_IDENT {
             return true;
         }
         self.inner
             .agents
             .lock()
-            .map(|agents| agents.values().any(|a| a.ident == ident))
+            .map(|agents| {
+                agents
+                    .values()
+                    .any(|a| a.present && a.room_id == room_id && a.ident == ident)
+            })
             .unwrap_or(false)
     }
 
     pub fn present_agents(&self) -> Vec<AgentInfo> {
+        self.present_agents_in_room(DEFAULT_ROOM_ID)
+    }
+
+    pub fn present_agents_in_room(&self, room_id: &str) -> Vec<AgentInfo> {
         self.inner
             .agents
             .lock()
             .map(|agents| {
-                let mut list: Vec<AgentInfo> =
-                    agents.values().filter(|a| a.present).cloned().collect();
+                let mut list: Vec<AgentInfo> = agents
+                    .values()
+                    .filter(|a| a.present && a.room_id == room_id)
+                    .cloned()
+                    .collect();
                 list.sort_by(|a, b| a.joined_at.cmp(&b.joined_at));
                 list
             })
@@ -398,45 +668,84 @@ impl RoomState {
         kind: MsgKind,
         text: impl Into<String>,
     ) -> RoomMessage {
-        let text = frame_text(text.into());
+        self.post_in_room(DEFAULT_ROOM_ID, from, from_label, to, kind, text)
+    }
 
-        if kind != MsgKind::System {
-            if let Ok(log) = self.inner.log.lock() {
+    pub fn post_in_room(
+        &self,
+        room_id: &str,
+        from: &str,
+        from_label: &str,
+        to: Option<String>,
+        kind: MsgKind,
+        text: impl Into<String>,
+    ) -> RoomMessage {
+        let room_id = normalize_room_id(room_id);
+        let text = frame_text(text.into());
+        let message = if let Ok(mut log) = self.inner.log.lock() {
+            if kind != MsgKind::System {
                 if let Some(last) = log.last() {
-                    if last.from == from && last.to == to && last.text == text {
+                    if last.room_id == room_id
+                        && last.from == from
+                        && last.to == to
+                        && last.text == text
+                    {
                         return last.clone();
                     }
                 }
             }
-        }
-
-        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let message = RoomMessage {
-            id,
-            ts: now_ts(),
-            from: from.to_string(),
-            from_label: from_label.to_string(),
-            to,
-            kind,
-            text,
-        };
-        if let Ok(mut log) = self.inner.log.lock() {
+            // L'id et l'insertion sont dans la meme section critique : le Vec
+            // reste strictement trie meme avec 100 emetteurs concurrents.
+            let message = RoomMessage {
+                id: self.inner.next_id.fetch_add(1, Ordering::SeqCst),
+                ts: now_ts(),
+                room_id: room_id.clone(),
+                from: from.to_string(),
+                from_label: from_label.to_string(),
+                to,
+                kind,
+                text,
+            };
             log.push(message.clone());
-        }
+            if log.len() > LOG_MEMORY_MAX {
+                let excess = log.len() - LOG_MEMORY_MAX;
+                log.drain(..excess);
+            }
+            message
+        } else {
+            RoomMessage {
+                id: self.inner.next_id.fetch_add(1, Ordering::SeqCst),
+                ts: now_ts(),
+                room_id,
+                from: from.to_string(),
+                from_label: from_label.to_string(),
+                to,
+                kind,
+                text,
+            }
+        };
         self.persist(&message);
-        let _ = self.inner.notify.send(id);
+        let _ = self.inner.notify.send(message.id);
         message
     }
 
     /// Long-poll : attend l'arrivee d'un message visible par `ident` posterieur
     /// a `since`, borne par `timeout`. Renvoie immediatement si des messages
     /// sont deja disponibles, sinon `[]` a l'expiration.
-    pub async fn wait_for(&self, ident: &str, since: u64, timeout: Duration) -> Vec<RoomMessage> {
-        let existing = self.messages_for(ident, since);
+    pub async fn wait_for(
+        &self,
+        room_id: &str,
+        ident: &str,
+        since: u64,
+        timeout: Duration,
+    ) -> Vec<RoomMessage> {
+        // Souscrit AVANT le premier read : aucun message ne peut tomber dans la
+        // fenetre entre "rien a lire" et l'installation du receiver.
+        let mut rx = self.subscribe();
+        let existing = self.messages_for_room(room_id, ident, since);
         if !existing.is_empty() {
             return existing;
         }
-        let mut rx = self.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -445,7 +754,7 @@ impl RoomState {
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(_id)) => {
-                    let msgs = self.messages_for(ident, since);
+                    let msgs = self.messages_for_room(room_id, ident, since);
                     if !msgs.is_empty() {
                         return msgs;
                     }
@@ -454,33 +763,54 @@ impl RoomState {
                 }
                 // Lagged : on recheck immediatement.
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                    let msgs = self.messages_for(ident, since);
+                    let msgs = self.messages_for_room(room_id, ident, since);
                     if !msgs.is_empty() {
                         return msgs;
                     }
                 }
                 // Canal ferme ou timeout : on rend la main.
-                _ => return self.messages_for(ident, since),
+                _ => return self.messages_for_room(room_id, ident, since),
             }
         }
     }
 
     /// Poste au nom de l'operateur humain (UI).
     pub fn operator_post(&self, to: Option<String>, text: String) -> RoomMessage {
-        let kind = if to.is_some() { MsgKind::Dm } else { MsgKind::Room };
-        self.post(OPERATOR_IDENT, "Operateur", to, kind, text)
+        self.operator_post_in_room(DEFAULT_ROOM_ID, to, text)
+    }
+
+    pub fn operator_post_in_room(
+        &self,
+        room_id: &str,
+        to: Option<String>,
+        text: String,
+    ) -> RoomMessage {
+        let kind = if to.is_some() {
+            MsgKind::Dm
+        } else {
+            MsgKind::Room
+        };
+        self.post_in_room(room_id, OPERATOR_IDENT, "Operateur", to, kind, text)
     }
 
     /// Messages visibles pour `ident` avec `id > since` :
     /// - toutes les diffusions salon + messages systeme,
     /// - les DM dont il est l'emetteur ou le destinataire.
     pub fn messages_for(&self, ident: &str, since: u64) -> Vec<RoomMessage> {
-        self.inner
+        self.messages_for_room(DEFAULT_ROOM_ID, ident, since)
+    }
+
+    pub fn messages_for_room(&self, room_id: &str, ident: &str, since: u64) -> Vec<RoomMessage> {
+        let room_id = normalize_room_id(room_id);
+        let messages: Vec<RoomMessage> = self
+            .inner
             .log
             .lock()
             .map(|log| {
-                log.iter()
-                    .filter(|m| m.id > since)
+                let start = log.partition_point(|message| message.id <= since);
+                log[start..]
+                    .iter()
+                    .filter(|message| message.room_id == room_id)
                     .filter(|m| match &m.to {
                         None => true,
                         Some(target) => target == ident || m.from == ident,
@@ -488,7 +818,16 @@ impl RoomState {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let cursor = messages
+            .iter()
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(since);
+        if let Ok(mut cursors) = self.inner.read_cursors.lock() {
+            cursors.insert(format!("{room_id}\0{ident}"), cursor);
+        }
+        messages
     }
 
     pub fn cursor(&self) -> u64 {
@@ -496,22 +835,48 @@ impl RoomState {
     }
 
     pub fn snapshot(&self) -> RoomSnapshot {
+        self.snapshot_for_room(DEFAULT_ROOM_ID)
+    }
+
+    pub fn snapshot_for_room(&self, room_id: &str) -> RoomSnapshot {
+        let room_id = normalize_room_id(room_id);
         let agents = self
             .inner
             .agents
             .lock()
             .map(|a| {
-                let mut list: Vec<AgentInfo> = a.values().cloned().collect();
+                let mut list: Vec<AgentInfo> = a
+                    .values()
+                    .filter(|agent| agent.room_id == room_id)
+                    .cloned()
+                    .collect();
                 list.sort_by(|x, y| x.joined_at.cmp(&y.joined_at));
                 list
             })
             .unwrap_or_default();
         let present = agents.iter().filter(|a| a.present).count();
-        let total_messages = self.inner.log.lock().map(|l| l.len()).unwrap_or(0);
+        let (total_messages, oldest_cursor) = self
+            .inner
+            .log
+            .lock()
+            .map(|log| {
+                let mut visible = log.iter().filter(|message| message.room_id == room_id);
+                let oldest = visible.next().map(|message| message.id).unwrap_or(0);
+                let total = log
+                    .iter()
+                    .filter(|message| message.room_id == room_id)
+                    .count();
+                (total, oldest)
+            })
+            .unwrap_or((0, 0));
         RoomSnapshot {
+            room_id: room_id.clone(),
             present,
             total_messages,
             cursor: self.cursor(),
+            oldest_cursor,
+            coordination: self.inner.merge_queue.snapshot(&room_id),
+            store_owner: self.inner.data_dir.is_some(),
             agents,
         }
     }
@@ -581,7 +946,10 @@ fn bearer_token(headers: &HeaderMap) -> String {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    raw.strip_prefix("Bearer ").unwrap_or(raw).trim().to_string()
+    raw.strip_prefix("Bearer ")
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
 }
 
 async fn mcp_post(State(state): State<RoomState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -642,7 +1010,10 @@ fn wait_call(msg: &Value) -> Option<(Value, Value)> {
         return None;
     }
     let id = msg.get("id").cloned()?;
-    let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+    let args = msg
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or(json!({}));
     Some((id, args))
 }
 
@@ -654,7 +1025,12 @@ async fn run_wait_for_messages(state: &RoomState, agent: &AgentInfo, args: &Valu
         .unwrap_or(WAIT_DEFAULT_MS)
         .clamp(0, WAIT_MAX_MS);
     let messages = state
-        .wait_for(&agent.ident, since, Duration::from_millis(timeout_ms))
+        .wait_for(
+            &agent.room_id,
+            &agent.ident,
+            since,
+            Duration::from_millis(timeout_ms),
+        )
         .await;
     let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
     tool_ok(json!({ "messages": messages, "cursor": cursor }))
@@ -674,10 +1050,7 @@ fn handle_one(state: &RoomState, agent: &AgentInfo, token: &str, msg: &Value) ->
 
     match method {
         "initialize" => {
-            state
-                .inner
-                .initialize_count
-                .fetch_add(1, Ordering::Relaxed);
+            state.inner.initialize_count.fetch_add(1, Ordering::Relaxed);
             let protocol = msg
                 .pointer("/params/protocolVersion")
                 .and_then(Value::as_str)
@@ -688,7 +1061,7 @@ fn handle_one(state: &RoomState, agent: &AgentInfo, token: &str, msg: &Value) ->
                 json!({
                     "protocolVersion": protocol,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "codex-switch-agent-room", "version": env!("CARGO_PKG_VERSION") }
+                    "serverInfo": { "name": "codex-switch-workspace-collab", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
         }
@@ -719,22 +1092,22 @@ fn tools_schema() -> Value {
     json!([
         {
             "name": "whoami",
-            "description": "Renvoie ta propre identite dans le salon (ton ident public, ton label, ton compte) et le nombre d'agents presents.",
+            "description": "Renvoie ta propre identite dans la collaboration du dossier et le nombre d'agents presents dans ce meme dossier.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "list_agents",
-            "description": "Liste les autres agents actuellement presents dans le salon (ident public a utiliser pour un message prive, label, dossier de travail).",
+            "description": "Liste uniquement les autres agents presents dans ton dossier logique.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "send_message",
-            "description": "Envoie un message. Sans 'to', il est diffuse a tout le salon. Avec 'to' (un ident public renvoye par list_agents), c'est un message prive a cet agent.",
+            "description": "Envoie un message. Sans 'to', il est diffuse aux agents de ton dossier. Avec 'to', c'est un message prive a un agent du meme dossier.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "Le contenu du message." },
-                    "to": { "type": "string", "description": "Ident public du destinataire pour un message prive. Omets pour diffuser au salon." }
+                    "to": { "type": "string", "description": "Ident public du destinataire dans le meme dossier. Omets pour diffuser au dossier." }
                 },
                 "required": ["text"],
                 "additionalProperties": false
@@ -742,7 +1115,7 @@ fn tools_schema() -> Value {
         },
         {
             "name": "read_messages",
-            "description": "Lit les messages qui te concernent (diffusions du salon + messages prives pour toi) posterieurs au curseur 'since'. Renvoie aussi un nouveau curseur a reutiliser.",
+            "description": "Lit les messages de ton dossier qui te concernent, posterieurs au curseur 'since'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -762,6 +1135,65 @@ fn tools_schema() -> Value {
                 },
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "claim_task",
+            "description": "Prend atomiquement une tache du task board. Echoue si un autre agent la possede deja.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "taskId": { "type": "string", "description": "Identifiant stable de la tache." },
+                    "description": { "type": "string", "description": "Description facultative, utilisee lors de la creation." }
+                },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "complete_task",
+            "description": "Marque terminee une tache que tu as prise.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "taskId": { "type": "string" } },
+                "required": ["taskId"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "list_tasks",
+            "description": "Liste le task board partage et ses claims.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "submit_for_merge",
+            "description": "Soumet les commits propres de ton worktree a la file FIFO. Le worker unique rebase, verifie optionnellement et met a jour la branche par CAS.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "commitSha": { "type": "string", "description": "Commit a soumettre (HEAD par defaut)." },
+                    "verify": { "type": "boolean", "description": "Execute CST_MERGE_VERIFY_COMMAND avant le CAS." }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "merge_status",
+            "description": "Renvoie l'etat durable d'une soumission de merge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "integer" } },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "list_landed",
+            "description": "Liste les merges atterris les plus recents et leurs nouveaux base SHA.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 200 } },
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -774,11 +1206,15 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
             "accountId": agent.account_id,
             "agentId": agent.agent_id,
             "cwd": agent.cwd,
-            "presentAgents": state.present_agents().len(),
+            "workspaceId": agent.workspace_id,
+            "roomId": agent.room_id,
+            "baseSha": agent.merge_context.as_ref().map(|context| context.base_sha.as_str()),
+            "targetRef": agent.merge_context.as_ref().map(|context| context.target_ref.as_str()),
+            "presentAgents": state.present_agents_in_room(&agent.room_id).len(),
         })),
         "list_agents" => {
             let others: Vec<Value> = state
-                .present_agents()
+                .present_agents_in_room(&agent.room_id)
                 .into_iter()
                 .filter(|a| a.ident != agent.ident)
                 .map(|a| {
@@ -787,13 +1223,79 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
                         "label": a.label,
                         "agentId": a.agent_id,
                         "cwd": a.cwd,
+                        "workspaceId": a.workspace_id,
+                        "roomId": a.room_id,
                     })
                 })
                 .collect();
             tool_ok(json!({ "agents": others }))
         }
+        "claim_task" => {
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
+            let description = args.get("description").and_then(Value::as_str);
+            match state.inner.merge_queue.claim_task(
+                &agent.room_id,
+                task_id,
+                description,
+                &agent.ident,
+            ) {
+                Ok(task) => tool_ok(json!(task)),
+                Err(error) => tool_err(&error),
+            }
+        }
+        "complete_task" => {
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
+            match state
+                .inner
+                .merge_queue
+                .complete_task(&agent.room_id, task_id, &agent.ident)
+            {
+                Ok(task) => tool_ok(json!(task)),
+                Err(error) => tool_err(&error),
+            }
+        }
+        "list_tasks" => tool_ok(json!({
+            "tasks": state.inner.merge_queue.list_tasks(&agent.room_id)
+        })),
+        "submit_for_merge" => {
+            let Some(context) = agent.merge_context.clone() else {
+                return tool_err("cet agent n'a pas de worktree git mergeable");
+            };
+            let commit_sha = args.get("commitSha").and_then(Value::as_str);
+            let verify = args.get("verify").and_then(Value::as_bool).unwrap_or(false);
+            match state.inner.merge_queue.submit(
+                &agent.room_id,
+                &agent.ident,
+                agent.workspace_id.as_deref().unwrap_or(&agent.agent_id),
+                context,
+                commit_sha,
+                verify,
+            ) {
+                Ok(status) => tool_ok(json!(status)),
+                Err(error) => tool_err(&error),
+            }
+        }
+        "merge_status" => {
+            let Some(id) = args.get("id").and_then(Value::as_u64) else {
+                return tool_err("le champ entier 'id' est requis");
+            };
+            match state.inner.merge_queue.status(&agent.room_id, id) {
+                Ok(status) => tool_ok(json!(status)),
+                Err(error) => tool_err(&error),
+            }
+        }
+        "list_landed" => {
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            tool_ok(json!({
+                "landed": state.inner.merge_queue.list_landed(&agent.room_id, limit)
+            }))
+        }
         "send_message" => {
-            let text = args.get("text").and_then(Value::as_str).unwrap_or("").trim();
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             if text.is_empty() {
                 return tool_err("le champ 'text' est requis et non vide");
             }
@@ -812,22 +1314,33 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
                 if target == &agent.ident {
                     return tool_err("impossible de s'envoyer un message a soi-meme");
                 }
-                if !state.ident_exists(target) {
+                if !state.ident_exists_in_room(&agent.room_id, target) {
                     return tool_err(&format!(
                         "destinataire inconnu: '{target}' (utilise list_agents pour les idents valides)"
                     ));
                 }
             }
-            let kind = if to.is_some() { MsgKind::Dm } else { MsgKind::Room };
-            let message = state.post(&agent.ident, &agent.label, to.clone(), kind, text.to_string());
+            let kind = if to.is_some() {
+                MsgKind::Dm
+            } else {
+                MsgKind::Room
+            };
+            let message = state.post_in_room(
+                &agent.room_id,
+                &agent.ident,
+                &agent.label,
+                to.clone(),
+                kind,
+                text.to_string(),
+            );
             tool_ok(json!({
                 "id": message.id,
-                "deliveredTo": to.unwrap_or_else(|| "room".to_string()),
+                "deliveredTo": to.unwrap_or_else(|| "workspace".to_string()),
             }))
         }
         "read_messages" => {
             let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
-            let messages = state.messages_for(&agent.ident, since);
+            let messages = state.messages_for_room(&agent.room_id, &agent.ident, since);
             let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
             tool_ok(json!({ "messages": messages, "cursor": cursor }))
         }
@@ -835,7 +1348,7 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
         // `mcp_post` ; ici c'est le fallback non-bloquant (appel en lot).
         "wait_for_messages" => {
             let since = args.get("since").and_then(Value::as_u64).unwrap_or(0);
-            let messages = state.messages_for(&agent.ident, since);
+            let messages = state.messages_for_room(&agent.room_id, &agent.ident, since);
             let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
             tool_ok(json!({ "messages": messages, "cursor": cursor }))
         }
@@ -900,17 +1413,29 @@ fn accepted() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Provisioning de config.toml (via le CLI codex, merge-safe)
+// Provisioning de la config MCP par compte (via le CLI du provider, merge-safe)
 // ---------------------------------------------------------------------------
 
-/// Idempotent : verifie via `codex mcp get agent_room` ; si absent (ou URL
-/// differente), (re)ajoute via `codex mcp add ... --url <url>
-/// --bearer-token-env-var CST_ROOM_TOKEN`. `codex` fusionne dans le config.toml
-/// existant sans ecraser les autres entrees.
-pub fn provision(codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), String> {
-    let get = Command::new(codex_bin)
-        .args(["mcp", "get", "agent_room"])
-        .env("CODEX_HOME", codex_home)
+/// Idempotent : verifie via `<cli> mcp get workspace_collab` ; si absent (ou URL
+/// differente), (re)ajoute l'entree. Chaque CLI fusionne dans sa propre config
+/// sans ecraser les autres entrees :
+/// - **Codex** : `codex mcp add ... --url <url> --bearer-token-env-var
+///   CST_ROOM_TOKEN` (le token reste hors du config.toml).
+/// - **Claude** : `claude mcp add --transport http workspace_collab <url> --header
+///   "Authorization: Bearer ${CST_ROOM_TOKEN}" --scope user`. Claude n'a pas de
+///   flag `--bearer-token-env-var` ; on passe le token par **expansion
+///   d'environnement** (`${CST_ROOM_TOKEN}`) pour qu'il reste hors du fichier et
+///   demeure UNIQUE par PTY (comme pour Codex).
+pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> Result<(), String> {
+    let home_env = provider.home_env_var();
+
+    // Migration transparente : l'ancien nom n'est retire que du home isole de
+    // ce process, jamais du home canonique de l'utilisateur.
+    remove_mcp(provider, cli_bin, home, LEGACY_MCP_NAME);
+
+    let get = Command::new(cli_bin)
+        .args(["mcp", "get", COLLAB_MCP_NAME])
+        .env(home_env, home)
         .output();
 
     if let Ok(output) = &get {
@@ -922,29 +1447,48 @@ pub fn provision(codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), St
             }
             // Present mais URL differente (ex. port change) : on retire avant de
             // reajouter proprement.
-            deprovision(codex_bin, codex_home);
+            deprovision(provider, cli_bin, home);
         }
     }
 
-    let add = Command::new(codex_bin)
-        .args([
-            "mcp",
-            "add",
-            "agent_room",
-            "--url",
-            url,
-            "--bearer-token-env-var",
-            "CST_ROOM_TOKEN",
-        ])
-        .env("CODEX_HOME", codex_home)
+    let mut add = Command::new(cli_bin);
+    match provider {
+        Provider::Codex => {
+            add.args([
+                "mcp",
+                "add",
+                COLLAB_MCP_NAME,
+                "--url",
+                url,
+                "--bearer-token-env-var",
+                "CST_ROOM_TOKEN",
+            ]);
+        }
+        Provider::Claude => {
+            add.args([
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                COLLAB_MCP_NAME,
+                url,
+                "--header",
+                "Authorization: Bearer ${CST_ROOM_TOKEN}",
+                "--scope",
+                "user",
+            ]);
+        }
+    }
+    let add = add
+        .env(home_env, home)
         .output()
-        .map_err(|e| format!("lancement de `{codex_bin} mcp add` impossible: {e}"))?;
+        .map_err(|e| format!("lancement de `{cli_bin} mcp add` impossible: {e}"))?;
 
     if add.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "`codex mcp add` a echoue: {}",
+            "`{cli_bin} mcp add` a echoue: {}",
             String::from_utf8_lossy(&add.stderr).trim()
         ))
     }
@@ -952,10 +1496,15 @@ pub fn provision(codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), St
 
 /// Retire l'entree du salon (best-effort : un retrait d'une entree absente
 /// n'est pas une erreur bloquante).
-pub fn deprovision(codex_bin: &str, codex_home: &Path) {
-    let _ = Command::new(codex_bin)
-        .args(["mcp", "remove", "agent_room"])
-        .env("CODEX_HOME", codex_home)
+pub fn deprovision(provider: Provider, cli_bin: &str, home: &Path) {
+    remove_mcp(provider, cli_bin, home, COLLAB_MCP_NAME);
+    remove_mcp(provider, cli_bin, home, LEGACY_MCP_NAME);
+}
+
+fn remove_mcp(provider: Provider, cli_bin: &str, home: &Path, name: &str) {
+    let _ = Command::new(cli_bin)
+        .args(["mcp", "remove", name])
+        .env(provider.home_env_var(), home)
         .output();
 }
 
@@ -964,7 +1513,7 @@ fn unauthorized() -> Response {
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "error": "token de salon inconnu (agent non enregistre)" }).to_string(),
+            json!({ "error": "token de collaboration inconnu (agent non enregistre)" }).to_string(),
         ))
         .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
 }
@@ -980,9 +1529,13 @@ mod tests {
     fn meta(label: &str) -> AgentMeta {
         AgentMeta {
             agent_id: "codex".to_string(),
+            provider: Provider::Codex,
             account_id: "acc".to_string(),
             label: label.to_string(),
             cwd: Some("C:/proj".to_string()),
+            workspace_id: None,
+            room_id: DEFAULT_ROOM_ID.to_string(),
+            merge_context: None,
         }
     }
 
@@ -1028,6 +1581,10 @@ mod tests {
         assert!(names.contains(&"send_message"));
         assert!(names.contains(&"read_messages"));
         assert!(names.contains(&"list_agents"));
+        assert!(names.contains(&"claim_task"));
+        assert!(names.contains(&"submit_for_merge"));
+        assert!(names.contains(&"merge_status"));
+        assert!(names.contains(&"list_landed"));
     }
 
     #[test]
@@ -1068,9 +1625,19 @@ mod tests {
         let ident_b = state.lookup(&b).unwrap().ident;
 
         // A diffuse au salon.
-        call(&state, &a, "send_message", json!({ "text": "coucou salon" }));
+        call(
+            &state,
+            &a,
+            "send_message",
+            json!({ "text": "coucou salon" }),
+        );
         // A envoie un DM a B.
-        call(&state, &a, "send_message", json!({ "text": "prive B", "to": ident_b }));
+        call(
+            &state,
+            &a,
+            "send_message",
+            json!({ "text": "prive B", "to": ident_b }),
+        );
 
         let read = |token: &str| -> Vec<String> {
             let result = call(&state, token, "read_messages", json!({ "since": 0 }));
@@ -1145,7 +1712,12 @@ mod tests {
         // Au-dela de la capacite du bucket, au moins un envoi (avec textes
         // distincts pour eviter la dedup) doit etre refuse.
         for i in 0..(SEND_BUCKET_CAPACITY as usize + 5) {
-            let result = call(&state, &a, "send_message", json!({ "text": format!("m{i}") }));
+            let result = call(
+                &state,
+                &a,
+                "send_message",
+                json!({ "text": format!("m{i}") }),
+            );
             if result["isError"] == true {
                 blocked = true;
                 break;
@@ -1160,7 +1732,12 @@ mod tests {
         {
             let state = RoomState::with_data_dir(dir.clone());
             let a = state.register(meta("A"));
-            call(&state, &a, "send_message", json!({ "text": "persiste-moi" }));
+            call(
+                &state,
+                &a,
+                "send_message",
+                json!({ "text": "persiste-moi" }),
+            );
         }
         // Nouveau salon sur le meme repertoire : l'historique est recharge.
         let reloaded = RoomState::with_data_dir(dir.clone());
@@ -1168,7 +1745,12 @@ mod tests {
         assert!(all.iter().any(|m| m.text == "persiste-moi"));
         // next_id reprend apres le max charge : le prochain post a un id superieur.
         let b = reloaded.register(meta("B"));
-        let posted = call(&reloaded, &b, "send_message", json!({ "text": "apres-reload" }));
+        let posted = call(
+            &reloaded,
+            &b,
+            "send_message",
+            json!({ "text": "apres-reload" }),
+        );
         let new_id = tool_json(&posted)["id"].as_u64().unwrap();
         assert!(new_id > all.iter().map(|m| m.id).max().unwrap());
         let _ = fs::remove_dir_all(&dir);
@@ -1187,7 +1769,7 @@ mod tests {
             let ident_b = ident_b.clone();
             tokio::spawn(async move {
                 state
-                    .wait_for(&ident_b, cursor, Duration::from_secs(5))
+                    .wait_for(DEFAULT_ROOM_ID, &ident_b, cursor, Duration::from_secs(5))
                     .await
             })
         };
@@ -1199,6 +1781,110 @@ mod tests {
 
         let received = waiter.await.unwrap();
         assert!(received.iter().any(|m| m.text == "reveille-toi"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_hundred_long_pollers_receive_the_same_broadcast() {
+        let state = RoomState::new();
+        let agents = (0..100)
+            .map(|index| state.register(meta(&format!("agent-{index}"))))
+            .collect::<Vec<_>>();
+        let cursor = state.cursor();
+        let waiters = agents
+            .iter()
+            .map(|token| {
+                let state = state.clone();
+                let ident = state.lookup(token).unwrap().ident;
+                tokio::spawn(async move {
+                    state
+                        .wait_for(DEFAULT_ROOM_ID, &ident, cursor, Duration::from_secs(5))
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+        state.post(
+            "operator",
+            "Operateur",
+            None,
+            MsgKind::Room,
+            "broadcast-100",
+        );
+        for waiter in waiters {
+            let messages = waiter.await.unwrap();
+            assert!(messages
+                .iter()
+                .any(|message| message.text == "broadcast-100"));
+        }
+    }
+
+    #[test]
+    fn workspace_rooms_are_strictly_isolated() {
+        let state = RoomState::new();
+        let mut meta_a1 = meta("A1");
+        meta_a1.room_id = "workspace-a".to_string();
+        let mut meta_a2 = meta("A2");
+        meta_a2.room_id = "workspace-a".to_string();
+        let mut meta_b = meta("B");
+        meta_b.room_id = "workspace-b".to_string();
+
+        let token_a1 = state.register(meta_a1);
+        let token_a2 = state.register(meta_a2);
+        let token_b = state.register(meta_b);
+        let a1 = state.lookup(&token_a1).unwrap();
+        let a2 = state.lookup(&token_a2).unwrap();
+        let b = state.lookup(&token_b).unwrap();
+
+        assert_eq!(state.present_agents_in_room("workspace-a").len(), 2);
+        assert_eq!(state.present_agents_in_room("workspace-b").len(), 1);
+        assert!(state.ident_exists_in_room("workspace-a", &a2.ident));
+        assert!(!state.ident_exists_in_room("workspace-a", &b.ident));
+
+        state.post_in_room(
+            "workspace-a",
+            &a1.ident,
+            &a1.label,
+            None,
+            MsgKind::Room,
+            "visible seulement dans A",
+        );
+        assert!(state
+            .messages_for_room("workspace-a", &a2.ident, 0)
+            .iter()
+            .any(|message| message.text == "visible seulement dans A"));
+        assert!(!state
+            .messages_for_room("workspace-b", &b.ident, 0)
+            .iter()
+            .any(|message| message.text == "visible seulement dans A"));
+
+        let rejected = call_tool(
+            &state,
+            &a1,
+            &token_a1,
+            "send_message",
+            &json!({ "to": b.ident, "text": "tentative cross-workspace" }),
+        );
+        assert_eq!(rejected.get("isError").and_then(Value::as_bool), Some(true));
+        assert_eq!(state.snapshot_for_room("workspace-a").present, 2);
+        assert_eq!(state.snapshot_for_room("workspace-b").present, 1);
+    }
+
+    #[test]
+    fn in_memory_log_is_bounded_and_cursor_lookup_keeps_the_tail() {
+        let state = RoomState::new();
+        for index in 0..(LOG_MEMORY_MAX + 17) {
+            state.post(
+                "system",
+                "System",
+                None,
+                MsgKind::System,
+                format!("m-{index}"),
+            );
+        }
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.total_messages, LOG_MEMORY_MAX);
+        assert!(snapshot.oldest_cursor > 1);
+        let tail = state.messages_for("operator", snapshot.cursor - 2);
+        assert_eq!(tail.len(), 2);
     }
 
     fn uid_for_test() -> String {
@@ -1219,6 +1905,9 @@ mod tests {
             .iter()
             .map(|a| a["ident"].as_str().unwrap().to_string())
             .collect();
-        assert!(idents.is_empty(), "B est parti, la liste pour A doit etre vide");
+        assert!(
+            idents.is_empty(),
+            "B est parti, la liste pour A doit etre vide"
+        );
     }
 }

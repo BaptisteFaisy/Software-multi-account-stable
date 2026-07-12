@@ -12,11 +12,43 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Fournisseur CLI gere par un compte / un agent.
+///
+/// `Codex` (ChatGPT/OpenAI) est le defaut historique : les comptes et agents
+/// existants (champ `provider` absent du settings.json) ainsi que tout code qui
+/// ne precise pas de provider restent Codex, ce qui preserve le comportement
+/// actuel bit pour bit. `Claude` designe Claude Code (CLI `claude`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Codex,
+    Claude,
+}
+
+impl Provider {
+    /// Identifiant stable (utilise pour les logs, l'agent-room, l'UI).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Codex => "codex",
+            Provider::Claude => "claude",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountProfile {
     pub id: String,
     pub label: String,
+    /// Fournisseur CLI de ce compte. `#[serde(default)]` => les comptes crees
+    /// par une version anterieure (sans ce champ) sont interpretes comme Codex.
+    #[serde(default)]
+    pub provider: Provider,
+    /// Dossier "home" isole du compte. Pour Codex c'est `CODEX_HOME` ; pour
+    /// Claude c'est `CLAUDE_CONFIG_DIR` (meme role : sessions + credentials +
+    /// config propres au compte). Le nom de champ reste `codexHome` cote JSON
+    /// pour la retro-compat des settings.json existants.
     pub codex_home: String,
     #[serde(default)]
     pub project_dir: Option<String>,
@@ -29,6 +61,14 @@ pub struct AccountProfile {
     /// settings.json) sont migres a `true` au chargement via ce default serde.
     #[serde(default = "default_true")]
     pub bypass: bool,
+    /// Modele Codex par defaut de CE compte. `None` preserve le comportement et
+    /// le `config.toml` des profils crees par une ancienne version de l'app.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Intensite de raisonnement Codex (`model_reasoning_effort`) de CE compte.
+    /// `None` laisse une eventuelle valeur existante du `config.toml` intacte.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -72,6 +112,25 @@ pub struct AccountRateLimitBucketView {
     pub plan_type: Option<String>,
 }
 
+/// Capacites d'intensite exposees par le catalogue du CLI Codex pour un
+/// modele precis. Le frontend ne doit pas inventer une liste globale : `max`
+/// et `ultra`, par exemple, ne sont proposes que par certains modeles.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningEffortView {
+    pub reasoning_effort: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountModelView {
+    pub id: String,
+    pub display_name: String,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<ModelReasoningEffortView>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyProfile {
@@ -91,6 +150,11 @@ pub struct AgentProfile {
     pub id: String,
     pub label: String,
     pub command: String,
+    /// Fournisseur CLI pilote par cet agent. `#[serde(default)]` => les agents
+    /// existants (sans ce champ) sont Codex. L'agent Claude Code integre porte
+    /// `Provider::Claude`.
+    #[serde(default)]
+    pub provider: Provider,
     /// "cli" : la commande est envoyee dans le terminal (Codex).
     /// "ide" : la commande est un lanceur d'editeur (code, cursor, windsurf,
     /// trae, antigravity, kiro) ouvert sur le dossier projet — c'est ainsi que
@@ -105,6 +169,27 @@ pub struct AgentProfile {
     pub status_command: Option<String>,
     #[serde(default)]
     pub doctor_command: Option<String>,
+}
+
+/// Un **workspace** = un dossier projet ouvert par l'utilisateur, qui sert de
+/// contexte a un ensemble de chats (comme OpenCode / Codex / Claude Code). Le
+/// registre des workspaces est persiste dans `settings.json` afin de suivre
+/// l'utilisateur sur ses appareils (desktop/web/Android), a la difference du
+/// pointeur de workspace ACTIF qui reste local a l'appareil (localStorage).
+///
+/// L'appartenance d'un chat a un workspace n'est PAS stockee ici : elle est
+/// derivee cote client en comparant le `cwd` de la discussion au `path` du
+/// workspace. On ne conserve donc jamais de reference de chat fragile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceProfile {
+    /// Identite stable = chemin normalise (cf. `normalize_workspace_path`). Le
+    /// backend le recalcule toujours afin de fusionner les anciens doublons.
+    pub id: String,
+    /// Libelle affiche (par defaut le nom du dossier), personnalisable.
+    pub label: String,
+    /// Chemin du dossier projet (tel que saisi/choisi par l'utilisateur).
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,16 +223,26 @@ pub struct AppSettings {
     /// (import + suppression).
     #[serde(default)]
     pub auto_discover_accounts: bool,
+    /// Registre des workspaces (dossiers projets ouverts). `#[serde(default)]`
+    /// => les settings.json anterieurs (sans ce champ) restent lisibles et
+    /// demarrent avec une liste vide, ensuite peuplee par migration du
+    /// localStorage cote client.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceProfile>,
+    /// Identites normalisees des workspaces explicitement fermes. Elles
+    /// empechent une ancienne discussion ou le MRU d'un autre appareil de les
+    /// recreer automatiquement ; une ouverture explicite retire le tombstone.
+    #[serde(default)]
+    pub closed_workspace_ids: Vec<String>,
 }
 
-/// Reglages du salon d'agents (« Agent Room »). Desactive par defaut : tant que
-/// `enabled` est faux, l'app n'ecrit RIEN dans les `CODEX_HOME` et ne demarre
-/// aucun serveur.
+/// Reglages historiques du transport MCP. `enabled` est conserve uniquement
+/// pour relire les anciens settings ; la collaboration workspace est desormais
+/// native et toujours disponible dans les homes isoles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRoomConfig {
-    /// Active le salon : demarrage du serveur MCP + provisioning des agents
-    /// (ecriture d'une entree `[mcp_servers.agent_room]` mergee dans config.toml).
+    /// Champ de compatibilite, ignore par le runtime natif.
     #[serde(default)]
     pub enabled: bool,
     /// Port loopback du serveur MCP du salon (desktop).
@@ -213,6 +308,7 @@ fn default_auto_install_extension() -> bool {
 }
 
 const CODEX_AGENT_ID: &str = "codex";
+const CLAUDE_AGENT_ID: &str = "claude";
 const KOMBAI_AGENT_ID: &str = "kombai";
 
 fn default_agent_kind() -> String {
@@ -245,6 +341,7 @@ pub struct PoolConfig {
 const SESSION_LIMIT_MINS: i64 = 5 * 60;
 const WEEKLY_LIMIT_MINS: i64 = 7 * 24 * 60;
 const RATE_LIMIT_READ_TIMEOUT_SECS: u64 = 18;
+const MODEL_CATALOG_TIMEOUT_SECS: u64 = 12;
 
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -290,6 +387,9 @@ fn default_true() -> bool {
     true
 }
 
+const DEFAULT_ACCOUNT_MODEL: &str = "gpt-5.6-sol";
+const DEFAULT_ACCOUNT_REASONING_EFFORT: &str = "medium";
+
 #[tauri::command]
 pub fn load_settings() -> Result<AppSettings, String> {
     let path = settings_path()?;
@@ -311,6 +411,9 @@ pub fn load_settings() -> Result<AppSettings, String> {
     if ensure_agents(&mut settings) {
         changed = true;
     }
+    if ensure_workspaces(&mut settings) {
+        changed = true;
+    }
     if sync_account_limit_trackers(&mut settings) {
         changed = true;
     }
@@ -324,31 +427,60 @@ pub fn load_settings() -> Result<AppSettings, String> {
 pub fn save_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     let path = settings_path()?;
     ensure_agents(&mut settings);
+    ensure_workspaces(&mut settings);
     sync_account_limit_trackers(&mut settings);
     write_settings(&path, &settings)?;
     Ok(settings)
 }
 
 #[tauri::command]
-pub fn ensure_account_home(codex_home: String) -> Result<(), String> {
+pub fn ensure_account_home(
+    codex_home: String,
+    provider: Option<Provider>,
+    bypass: bool,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<(), String> {
     let home = expand_home(&codex_home)?;
-    fs::create_dir_all(&home).map_err(|error| error.to_string())
+    fs::create_dir_all(&home).map_err(|error| error.to_string())?;
+    // `provider` absent (anciens appels front) => Codex : comportement inchange.
+    provider
+        .unwrap_or_default()
+        .write_account_config(&home, bypass, model.as_deref(), reasoning_effort.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
-/// Retire un compte du Pool / de la liste. Ne touche PAS au dossier CODEX_HOME
-/// sur le disque : seul l'enregistrement dans `settings.json` est supprime.
-/// Avec l'auto-detection desactivee (`auto_discover_accounts = false`), le
-/// compte ne reapparait pas au prochain chargement.
+/// Retire un compte du Pool / de la liste. Si `delete_files` est faux, ne touche
+/// PAS au dossier CODEX_HOME sur le disque : seul l'enregistrement dans
+/// `settings.json` est supprime (avec `auto_discover_accounts = false`, le compte
+/// ne reapparait pas au prochain chargement).
+///
+/// Si `delete_files` est vrai, le dossier CODEX_HOME du compte est aussi efface
+/// du disque (auth.json, sessions, config...). Garde-fous stricts :
+/// - le dossier n'est efface que s'il ressemble a un CODEX_HOME (nom `.codex*`,
+///   dossier sous `codex-homes`, ou presence d'un `auth.json`/`config.toml`) ;
+/// - jamais le dossier utilisateur, un de ses ancetres, ni le dossier de
+///   configuration de l'app ;
+/// - si un AUTRE compte restant pointe vers le meme dossier, il est conserve.
+/// En cas de dossier dangereux ou non supprimable, l'operation est annulee AVANT
+/// d'ecrire `settings.json` (etat inchange) et l'erreur est remontee : le compte
+/// reste alors present et l'utilisateur peut le retirer sans effacer les fichiers.
 #[tauri::command]
-pub fn remove_account(account_id: String) -> Result<AppSettings, String> {
+pub fn remove_account(account_id: String, delete_files: bool) -> Result<AppSettings, String> {
     let path = settings_path()?;
     let mut settings = load_settings()?;
 
-    let before = settings.accounts.len();
-    settings.accounts.retain(|account| account.id != account_id);
-    if settings.accounts.len() == before {
+    let Some(target) = settings
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .cloned()
+    else {
         return Err("Compte introuvable".to_string());
-    }
+    };
+
+    settings.accounts.retain(|account| account.id != account_id);
 
     if settings.default_account_id.as_deref() == Some(account_id.as_str()) {
         settings.default_account_id = settings.accounts.first().map(|account| account.id.clone());
@@ -356,8 +488,120 @@ pub fn remove_account(account_id: String) -> Result<AppSettings, String> {
 
     ensure_agents(&mut settings);
     sync_account_limit_trackers(&mut settings);
+
+    // Suppression du dossier AVANT l'ecriture de settings.json : si elle echoue
+    // (chemin refuse par les garde-fous, verrou fichier...), on renvoie l'erreur
+    // sans rien persister -> l'etat reste coherent (le compte est toujours la).
+    if delete_files {
+        let normalized_target = normalize_string_path(&target.codex_home);
+        let still_referenced = settings
+            .accounts
+            .iter()
+            .any(|account| normalize_string_path(&account.codex_home) == normalized_target);
+        if !still_referenced {
+            delete_codex_home_dir(&target.codex_home)?;
+        }
+    }
+
     write_settings(&path, &settings)?;
     Ok(settings)
+}
+
+/// Supprime le dossier CODEX_HOME d'un compte apres validation stricte. Un
+/// dossier absent est traite comme un succes (rien a effacer).
+fn delete_codex_home_dir(codex_home: &str) -> Result<(), String> {
+    let path = expand_home(codex_home)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "Le CODEX_HOME du compte n'est pas un dossier : {}",
+            path.display()
+        ));
+    }
+    guard_deletable_codex_home(&path)?;
+    fs::remove_dir_all(&path)
+        .map_err(|error| format!("Suppression de {} impossible : {error}", path.display()))
+}
+
+/// Refuse d'effacer un dossier qui n'est pas manifestement le CODEX_HOME d'un
+/// compte, ou qui est un chemin critique (racine/drive root, dossier
+/// utilisateur et ses ancetres, dossier de configuration de l'app).
+fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
+    let path_key = guard_key(path);
+
+    // Chemins trop courts (racine, drive root, chemin relatif ambigu) : refus.
+    if path.components().count() < 3 || path.file_name().is_none() {
+        return Err(format!(
+            "Refus : chemin trop court ou critique ({}).",
+            path.display()
+        ));
+    }
+
+    // Dossier utilisateur lui-meme ou l'un de ses ancetres.
+    if let Ok(home) = home_dir() {
+        let home_key = guard_key(&home);
+        if path_key == home_key || home_key.starts_with(&format!("{path_key}\\")) {
+            return Err(format!(
+                "Refus : {} est le dossier utilisateur (ou un parent).",
+                path.display()
+            ));
+        }
+    }
+
+    // Dossier de configuration de l'app (settings.json, agent-room...).
+    if let Ok(settings_file) = settings_path() {
+        if let Some(app_dir) = settings_file.parent() {
+            let app_key = guard_key(app_dir);
+            if path_key == app_key || app_key.starts_with(&format!("{path_key}\\")) {
+                return Err(format!(
+                    "Refus : {} est le dossier de configuration de l'app.",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    // Le dossier doit ressembler au home d'un compte (Codex ou Claude).
+    let looks_like_home = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            is_codex_like_dir(name)
+                || Provider::Codex.is_home_like_dir(name)
+                || Provider::Claude.is_home_like_dir(name)
+        })
+        .unwrap_or(false);
+    let under_homes = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.eq_ignore_ascii_case("codex-homes") || name.eq_ignore_ascii_case("claude-homes")
+        })
+        .unwrap_or(false);
+    let has_marker = path.join("auth.json").is_file()      // Codex
+        || path.join("config.toml").is_file()              // Codex
+        || path.join(".credentials.json").is_file()        // Claude
+        || path.join(".claude.json").is_file(); // Claude
+
+    if !(looks_like_home || under_homes || has_marker) {
+        return Err(format!(
+            "Refus : {} ne ressemble pas a un dossier de compte Codex (nom .codex*, dossier codex-homes, ou auth.json/config.toml requis).",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Cle normalisee pour comparer des chemins de facon robuste : minuscules,
+/// separateurs `\`, sans separateur final.
+fn guard_key(path: &Path) -> String {
+    normalize_string_path(&path.to_string_lossy())
+        .trim_end_matches('\\')
+        .to_string()
 }
 
 #[tauri::command]
@@ -366,6 +610,13 @@ pub async fn account_limit_status() -> Result<Vec<AccountLimitView>, String> {
     tauri::async_runtime::spawn_blocking(move || account_limit_views(&settings))
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn account_model_catalog(account_id: String) -> Result<Vec<AccountModelView>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_account_model_catalog(&account_id))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -466,6 +717,161 @@ fn parse_import_json_content(content: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    fn fresh_account_home(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        env::temp_dir().join(format!("cst-{prefix}-{unique}"))
+    }
+
+    #[test]
+    fn account_home_is_provisioned_with_all_account_defaults() {
+        let home = fresh_account_home("account-config");
+
+        ensure_account_home(
+            home.to_string_lossy().to_string(),
+            Some(Provider::Codex),
+            true,
+            Some("gpt-5.6-sol".to_string()),
+            Some("medium".to_string()),
+        )
+        .expect("account home should be created and provisioned");
+
+        let config = fs::read_to_string(home.join("config.toml"))
+            .expect("config.toml should exist immediately");
+        assert!(config.contains("approval_policy = \"never\""));
+        assert!(config.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        assert!(config.contains("model_reasoning_effort = \"medium\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn non_bypass_account_gets_safe_explicit_permissions() {
+        let home = fresh_account_home("safe-account");
+
+        ensure_account_home(
+            home.to_string_lossy().to_string(),
+            Some(Provider::Codex),
+            false,
+            None,
+            None,
+        )
+        .expect("non-bypass account should be provisioned");
+
+        let config = fs::read_to_string(home.join("config.toml")).expect("config.toml");
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        assert!(!config.contains("danger-full-access"));
+        assert!(!config.contains("approval_policy = \"never\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn disabling_bypass_replaces_previously_persisted_bypass() {
+        let home = fresh_account_home("bypass-transition");
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("high"))
+            .expect("bypass config");
+        ensure_codex_account_config(&home, false, Some("gpt-5.6-sol"), Some("high"))
+            .expect("safe config");
+
+        let config = fs::read_to_string(home.join("config.toml")).expect("config.toml");
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        assert!(!config.contains("danger-full-access"));
+        assert!(!config.contains("approval_policy = \"never\""));
+        assert_eq!(config.matches("approval_policy =").count(), 1);
+        assert_eq!(config.matches("sandbox_mode =").count(), 1);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn account_config_preserves_sections_and_is_idempotent() {
+        let home = fresh_account_home("config-idempotent");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "[mcp_servers.agent_room]\nurl = \"http://127.0.0.1:8123/mcp\"\n",
+        )
+        .unwrap();
+
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"))
+            .expect("first provisioning");
+        let once = fs::read_to_string(home.join("config.toml")).unwrap();
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"))
+            .expect("second provisioning");
+        let twice = fs::read_to_string(home.join("config.toml")).unwrap();
+
+        assert_eq!(once, twice);
+        assert!(twice.contains("[mcp_servers.agent_room]"));
+        assert!(twice.contains("url = \"http://127.0.0.1:8123/mcp\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn account_config_rejects_invalid_reasoning_effort() {
+        let home = fresh_account_home("invalid-effort");
+        let error = ensure_codex_account_config(&home, true, None, Some("ultra mode"))
+            .expect_err("malformed effort must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!home.join("config.toml").exists());
+    }
+
+    #[test]
+    fn account_config_accepts_max_and_ultra_reasoning_efforts() {
+        let home = fresh_account_home("max-ultra-effort");
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("max"))
+            .expect("max effort");
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("ultra"))
+            .expect("ultra effort");
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("model_reasoning_effort = \"ultra\""));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn account_config_escapes_model_before_writing_toml() {
+        let home = fresh_account_home("model-escape");
+        let injected = "gpt-5.6-sol\"\nsandbox_mode = \"danger-full-access";
+        ensure_codex_account_config(&home, false, Some(injected), Some("low"))
+            .expect("escaped model should remain a TOML string");
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        ensure_codex_account_config(&home, false, Some(injected), Some("low"))
+            .expect("escaped model should stay idempotent");
+        let second = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(config, second);
+        assert!(
+            config.contains("model = \"gpt-5.6-sol\\\"\\nsandbox_mode = \\\"danger-full-access\"")
+        );
+        assert_eq!(config.matches("sandbox_mode =").count(), 2);
+        assert_eq!(config.matches("\nsandbox_mode =").count(), 1);
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn legacy_account_json_keeps_optional_model_fields_unset() {
+        let account: AccountProfile = serde_json::from_value(json!({
+            "id": "legacy",
+            "label": "Legacy",
+            "codexHome": "~/.codex-legacy",
+            "bypass": false
+        }))
+        .expect("legacy account should deserialize");
+
+        assert_eq!(account.model, None);
+        assert_eq!(account.reasoning_effort, None);
+    }
+
     fn assert_session_blob_import(content: &str) {
         let value = parse_import_json_content(content).expect("session blob should parse");
         let accounts = extract_import_accounts(&value);
@@ -516,7 +922,8 @@ mod tests {
 
     #[test]
     fn upsert_ignores_same_key_inside_a_table_and_comments() {
-        let existing = "# approval_policy = \"never\"\n[profiles.x]\napproval_policy = \"untrusted\"\n";
+        let existing =
+            "# approval_policy = \"never\"\n[profiles.x]\napproval_policy = \"untrusted\"\n";
         let out = upsert_top_level_string(existing, "approval_policy", "never");
         // La cle sous [profiles.x] et la ligne commentee ne sont pas touchees ;
         // la cle racine est prefixee.
@@ -603,11 +1010,83 @@ mod tests {
             agent_room: AgentRoomConfig::default(),
             codex_bypass: true,
             auto_discover_accounts: false,
+            workspaces: Vec::new(),
+            closed_workspace_ids: Vec::new(),
         }
     }
 
     #[test]
-    fn ensure_agents_seeds_codex_only_on_fresh_settings() {
+    fn workspace_base_name_is_utf8_safe_and_strips_git() {
+        // Regression: `base[len-4..]` panickait quand un caractere multi-octets
+        // chevauchait la borne len-4 (ex. « Éire », « 😀x »).
+        assert_eq!(workspace_base_name("C:\\Projects\\Éire"), "Éire");
+        assert_eq!(workspace_base_name("/home/u/😀x"), "😀x");
+        assert_eq!(workspace_base_name("/home/u/日本語"), "日本語");
+        // Strip `.git` insensible a la casse, mais pas si c'est tout le segment.
+        assert_eq!(workspace_base_name("/srv/myrepo.git"), "myrepo");
+        assert_eq!(workspace_base_name("/srv/Repo.GIT"), "Repo");
+        assert_eq!(workspace_base_name("C:/repos/.git"), ".git");
+        // Slashes finaux et backslashes mixtes.
+        assert_eq!(workspace_base_name("C:\\proj\\app\\"), "app");
+        assert_eq!(workspace_base_name("/a/b/c/"), "c");
+    }
+
+    #[test]
+    fn ensure_workspaces_dedups_and_fills_labels_without_panicking() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.workspaces = vec![
+            WorkspaceProfile {
+                id: "ancien-id-local".to_string(),
+                label: String::new(),
+                path: "C:\\Projects\\Éire\\".to_string(),
+            },
+            // Meme chemin avec une autre casse, d'autres separateurs et un id
+            // historique different : fusionne avec la premiere occurrence.
+            WorkspaceProfile {
+                id: "ancien-id-distant".to_string(),
+                label: "dup".to_string(),
+                path: "c:/projects/éire".to_string(),
+            },
+            // Chemin vide : retire.
+            WorkspaceProfile {
+                id: "x".to_string(),
+                label: "vide".to_string(),
+                path: "   ".to_string(),
+            },
+        ];
+
+        let changed = ensure_workspaces(&mut settings);
+
+        assert!(changed);
+        assert_eq!(settings.workspaces.len(), 1);
+        let ws = &settings.workspaces[0];
+        assert_eq!(ws.id, "c:/projects/éire");
+        // Label vide comble par le nom du dossier (UTF-8 safe).
+        assert_eq!(ws.label, "Éire");
+    }
+
+    #[test]
+    fn ensure_workspaces_keeps_closed_workspaces_closed() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.workspaces = vec![WorkspaceProfile {
+            id: "ancien-id".to_string(),
+            label: "Projet".to_string(),
+            path: "C:\\Projects\\Projet".to_string(),
+        }];
+        settings.closed_workspace_ids = vec![
+            " C:\\Projects\\Projet\\ ".to_string(),
+            "c:/projects/projet".to_string(),
+        ];
+
+        let changed = ensure_workspaces(&mut settings);
+
+        assert!(changed);
+        assert!(settings.workspaces.is_empty());
+        assert_eq!(settings.closed_workspace_ids, vec!["c:/projects/projet"]);
+    }
+
+    #[test]
+    fn ensure_agents_seeds_codex_and_claude_on_fresh_settings() {
         let mut settings = empty_settings("codex", Vec::new(), None);
 
         let changed = ensure_agents(&mut settings);
@@ -621,12 +1100,24 @@ mod tests {
         assert!(codex.builtin);
         assert_eq!(codex.command, "codex");
         assert_eq!(codex.kind, "cli");
+        assert_eq!(codex.provider, Provider::Codex);
         assert_eq!(codex.status_command.as_deref(), Some("login status"));
+        // L'agent Claude Code integre est seed a cote de Codex.
+        let claude = settings
+            .agents
+            .iter()
+            .find(|agent| agent.id == CLAUDE_AGENT_ID)
+            .expect("claude agent seeded");
+        assert!(claude.builtin);
+        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.kind, "cli");
+        assert_eq!(claude.provider, Provider::Claude);
         // Kombai n'est pas un agent terminal : il ne doit PAS etre seed ici.
         assert!(!settings
             .agents
             .iter()
             .any(|agent| agent.id == KOMBAI_AGENT_ID));
+        // L'agent actif par defaut reste Codex (comportement historique).
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
     }
 
@@ -636,6 +1127,7 @@ mod tests {
             id: KOMBAI_AGENT_ID.to_string(),
             label: "Kombai".to_string(),
             command: "kombai".to_string(),
+            provider: Provider::Codex,
             kind: "cli".to_string(),
             builtin: false,
             login_command: None,
@@ -659,6 +1151,7 @@ mod tests {
             id: KOMBAI_AGENT_ID.to_string(),
             label: "Kombai".to_string(),
             command: "my-kombai-wrapper".to_string(),
+            provider: Provider::Codex,
             kind: "cli".to_string(),
             builtin: false,
             login_command: None,
@@ -682,6 +1175,7 @@ mod tests {
             id: CODEX_AGENT_ID.to_string(),
             label: "Codex".to_string(),
             command: "codex-custom".to_string(),
+            provider: Provider::Codex,
             kind: "cli".to_string(),
             builtin: true,
             login_command: Some("login".to_string()),
@@ -709,6 +1203,120 @@ mod tests {
 
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
     }
+
+    #[test]
+    fn rollout_rate_limit_snapshot_parses_codex_snake_case() {
+        let home = fresh_account_home("rate-limit-rollout");
+        let archive = home
+            .join("sessions-archive")
+            .join("2026")
+            .join("07")
+            .join("12");
+        fs::create_dir_all(&archive).unwrap();
+        let rollout =
+            archive.join("rollout-2026-07-12T20-00-00-019f5701-fb46-7503-9abb-004a5316894b.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-07-12T19:13:41.754Z\",",
+                "\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",",
+                "\"rate_limits\":{\"limit_id\":\"codex\",\"plan_type\":\"plus\",",
+                "\"primary\":{\"used_percent\":54.0,\"window_minutes\":10080,",
+                "\"resets_at\":4102444800},\"secondary\":null}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let snapshot = scan_rollout_rate_limit_snapshot(&rollout).expect("quota snapshot");
+        assert_eq!(snapshot.buckets.len(), 1);
+        assert_eq!(snapshot.buckets[0].window_duration_mins, 10080);
+        assert_eq!(snapshot.buckets[0].used_percent, Some(54.0));
+        assert_eq!(snapshot.buckets[0].plan_type.as_deref(), Some("plus"));
+        assert!(snapshot.observed_at > 0);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn local_rate_limit_snapshot_prevents_false_zero_regression() {
+        let server = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 5000,
+            used_percent: Some(0.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+        let local = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 4000,
+            used_percent: Some(54.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+
+        let (merged, used_local) = merge_rate_limit_buckets(server, Some(&local), 1000);
+
+        assert!(used_local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].used_percent, Some(54.0));
+        assert_eq!(merged[0].resets_at, 4000);
+    }
+
+    #[test]
+    fn expired_local_rate_limit_snapshot_does_not_override_server() {
+        let server = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 5000,
+            used_percent: Some(0.0),
+            rate_limit_reached_type: None,
+            plan_type: None,
+        }];
+        let mut local = server.clone();
+        local[0].resets_at = 900;
+        local[0].used_percent = Some(99.0);
+
+        let (merged, used_local) = merge_rate_limit_buckets(server, Some(&local), 1000);
+
+        assert!(!used_local);
+        assert_eq!(merged[0].used_percent, Some(0.0));
+        assert_eq!(merged[0].resets_at, 5000);
+    }
+
+    #[test]
+    fn model_catalog_preserves_model_specific_max_and_ultra_efforts() {
+        let models = parse_account_model_catalog(&json!({
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "displayName": "GPT-5.6-Sol",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low", "description": "Fast" },
+                    { "reasoningEffort": "max", "description": "Maximum" },
+                    { "reasoningEffort": "ultra", "description": "Delegation" }
+                ]
+            }]
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(
+            models[0]
+                .supported_reasoning_efforts
+                .iter()
+                .map(|item| item.reasoning_effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "max", "ultra"]
+        );
+    }
 }
 
 pub fn load_settings_for_terminal() -> Result<AppSettings, String> {
@@ -716,19 +1324,24 @@ pub fn load_settings_for_terminal() -> Result<AppSettings, String> {
 }
 
 fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-
     let content = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
-    fs::write(path, content).map_err(|error| error.to_string())
+    crate::fs_util::atomic_write(path, content).map_err(|error| error.to_string())
 }
 
-fn settings_path() -> Result<PathBuf, String> {
-    if let Some(value) = env::var_os("CST_DATA_DIR") {
-        return Ok(PathBuf::from(value).join("settings.json"));
+/// Racine des donnees de COMPTES : `settings.json` + `codex-homes/`. Elle peut
+/// etre PARTAGEE entre plusieurs instances via `CST_ACCOUNTS_DIR` (ex. la version
+/// stable sur 8081 reutilise le dossier de la beta pour voir les memes comptes).
+/// Ordre de resolution : `CST_ACCOUNTS_DIR`, sinon `CST_DATA_DIR`, sinon
+/// APPDATA/XDG/.config. Quand `CST_ACCOUNTS_DIR` est absent, le resultat est
+/// IDENTIQUE a l'ancien comportement, de sorte que la beta et le desktop restent
+/// inchanges.
+fn accounts_config_dir() -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("CST_ACCOUNTS_DIR") {
+        return Ok(PathBuf::from(value));
     }
-
+    if let Some(value) = env::var_os("CST_DATA_DIR") {
+        return Ok(PathBuf::from(value));
+    }
     let base = if let Some(value) = env::var_os("APPDATA") {
         PathBuf::from(value)
     } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
@@ -736,8 +1349,33 @@ fn settings_path() -> Result<PathBuf, String> {
     } else {
         home_dir()?.join(".config")
     };
+    Ok(base.join("codex-switch-terminal"))
+}
 
-    Ok(base.join("codex-switch-terminal").join("settings.json"))
+/// Base optionnelle pour materialiser les homes de comptes (`codex-homes`) : suit
+/// la racine des comptes. `None` uniquement quand NI `CST_ACCOUNTS_DIR` NI
+/// `CST_DATA_DIR` ne sont definis (mode desktop historique => `~/.codex-pool-*`).
+fn accounts_root_opt() -> Option<PathBuf> {
+    env::var_os("CST_ACCOUNTS_DIR")
+        .or_else(|| env::var_os("CST_DATA_DIR"))
+        .map(PathBuf::from)
+}
+
+/// Base a laquelle s'expanse le jeton `%CST_DATA_DIR%` stocke dans `codexHome`
+/// (credentials des comptes). Alignee sur la racine des comptes pour que les deux
+/// instances resolvent le MEME `codex-homes`. Message d'erreur inchange.
+fn accounts_prefix_base() -> Result<PathBuf, String> {
+    accounts_root_opt().ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())
+}
+
+/// Repertoire parent des homes de comptes (`codex-homes`), aligne sur la racine
+/// des comptes (honore `CST_ACCOUNTS_DIR`, sinon `CST_DATA_DIR`).
+pub fn codex_homes_dir() -> Result<PathBuf, String> {
+    Ok(accounts_config_dir()?.join("codex-homes"))
+}
+
+fn settings_path() -> Result<PathBuf, String> {
+    Ok(accounts_config_dir()?.join("settings.json"))
 }
 
 /// Repertoire de persistance du salon d'agents (`.../agent-room`), aligne sur la
@@ -753,9 +1391,26 @@ pub fn agent_room_data_dir() -> Result<PathBuf, String> {
     } else {
         home_dir()?.join(".config")
     };
-    Ok(base
-        .join("codex-switch-terminal")
-        .join("agent-room"))
+    Ok(base.join("codex-switch-terminal").join("agent-room"))
+}
+
+/// Racine des donnees runtime (worktrees, homes isoles, merge queue). Reste
+/// pilotee par `CST_DATA_DIR` (par instance) et est DECOUPLEE de `settings_path()`
+/// qui peut, lui, etre redirige vers un dossier de comptes PARTAGE via
+/// `CST_ACCOUNTS_DIR`. Sans `CST_ACCOUNTS_DIR` le resultat est identique a
+/// l'ancien `parent(settings.json)`.
+pub fn runtime_data_dir() -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("CST_DATA_DIR") {
+        return Ok(PathBuf::from(value));
+    }
+    let base = if let Some(value) = env::var_os("APPDATA") {
+        PathBuf::from(value)
+    } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(value)
+    } else {
+        home_dir()?.join(".config")
+    };
+    Ok(base.join("codex-switch-terminal"))
 }
 
 fn discover_initial_settings() -> Result<AppSettings, String> {
@@ -774,6 +1429,8 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         agent_room: AgentRoomConfig::default(),
         codex_bypass: true,
         auto_discover_accounts: false,
+        workspaces: Vec::new(),
+        closed_workspace_ids: Vec::new(),
     };
 
     if env::var_os("CST_DATA_DIR").is_none() {
@@ -816,6 +1473,7 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
                 id: CODEX_AGENT_ID.to_string(),
                 label: "Codex".to_string(),
                 command: codex_command,
+                provider: Provider::Codex,
                 kind: "cli".to_string(),
                 builtin: true,
                 login_command: Some("login".to_string()),
@@ -823,6 +1481,29 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
                 doctor_command: Some("doctor --summary --ascii".to_string()),
             },
         );
+        changed = true;
+    }
+
+    // Agent Claude Code integre. Comme l'agent Codex, il est (re)cree s'il
+    // manque : Claude Code est un fournisseur pris en charge de premier rang.
+    // `login`/`status` se font en session interactive (`/login`, `/status`) et
+    // ne sont donc pas des sous-commandes CLI ; seul `claude doctor` en est une.
+    if !settings
+        .agents
+        .iter()
+        .any(|agent| agent.id == CLAUDE_AGENT_ID)
+    {
+        settings.agents.push(AgentProfile {
+            id: CLAUDE_AGENT_ID.to_string(),
+            label: "Claude Code".to_string(),
+            command: "claude".to_string(),
+            provider: Provider::Claude,
+            kind: "cli".to_string(),
+            builtin: true,
+            login_command: None,
+            status_command: None,
+            doctor_command: Some("doctor".to_string()),
+        });
         changed = true;
     }
 
@@ -874,6 +1555,112 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
             changed = true;
         }
     }
+
+    changed
+}
+
+/// Normalise un chemin de workspace pour en faire une identite stable. Doit
+/// rester alignee sur `normalizeWorkspacePath` cote front (src/main.ts) : trim,
+/// retrait des slashes finaux, `\\` -> `/`, puis minuscule UNIQUEMENT pour les
+/// chemins Windows (`X:/...`) et UNC (`//...`), insensibles a la casse.
+fn normalize_workspace_path(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches(['\\', '/']).replace('\\', "/");
+    let bytes = trimmed.as_bytes();
+    let is_windows_drive =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    if is_windows_drive || trimmed.starts_with("//") {
+        trimmed.to_lowercase()
+    } else {
+        trimmed
+    }
+}
+
+/// Dernier segment d'un chemin (nom du dossier, sans suffixe `.git`), pour un
+/// libelle par defaut. Aligne sur `workspaceBaseName` cote front.
+fn workspace_base_name(path: &str) -> String {
+    let cleaned = path.trim_end_matches(['\\', '/']);
+    let base = cleaned.rsplit(['\\', '/']).next().unwrap_or(cleaned);
+    // Retire un suffixe `.git` (insensible a la casse) SANS indexer le `str` par
+    // octet : `str::get` renvoie None si la borne n'est pas une frontiere de
+    // caractere, ce qui evite tout panic sur un nom de dossier multi-octets
+    // (ex. « Éire », « 😀x »). On ne retire pas `.git` s'il constitue tout le
+    // segment (dossier litteralement nomme `.git`).
+    let without_git = match base.len() {
+        n if n > 4 => match base.get(n - 4..) {
+            Some(tail) if tail.eq_ignore_ascii_case(".git") => &base[..n - 4],
+            _ => base,
+        },
+        _ => base,
+    };
+    if without_git.is_empty() {
+        path.trim().to_string()
+    } else {
+        without_git.to_string()
+    }
+}
+
+/// Garantit la coherence du registre de workspaces :
+/// - retire les entrees a chemin vide ;
+/// - recalcule un `id` manquant/incoherent depuis le chemin normalise ;
+/// - deduplique par `id` (premiere occurrence gardee) ;
+/// - complete un `label` vide par le nom du dossier ;
+/// - normalise les tombstones et leur donne priorite sur le registre ouvert.
+fn ensure_workspaces(settings: &mut AppSettings) -> bool {
+    let mut changed = false;
+    let mut closed_seen: HashSet<String> = HashSet::new();
+    let mut closed_ids: Vec<String> = Vec::with_capacity(settings.closed_workspace_ids.len());
+    for raw_id in &settings.closed_workspace_ids {
+        let id = normalize_workspace_path(raw_id);
+        if id.is_empty() || !closed_seen.insert(id.clone()) {
+            changed = true;
+            continue;
+        }
+        if raw_id != &id {
+            changed = true;
+        }
+        closed_ids.push(id);
+    }
+    if closed_ids != settings.closed_workspace_ids {
+        changed = true;
+    }
+    settings.closed_workspace_ids = closed_ids;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped: Vec<WorkspaceProfile> = Vec::with_capacity(settings.workspaces.len());
+
+    for mut ws in std::mem::take(&mut settings.workspaces) {
+        let path = ws.path.trim().to_string();
+        if path.is_empty() {
+            changed = true;
+            continue;
+        }
+        // Le chemin est la source de verite. Un ancien id non vide mais
+        // incoherent ne doit jamais permettre a deux chemins equivalents de
+        // survivre comme deux workspaces distincts.
+        let id = normalize_workspace_path(&path);
+        if closed_seen.contains(&id) {
+            changed = true;
+            continue;
+        }
+        if !seen.insert(id.clone()) {
+            changed = true;
+            continue;
+        }
+        let label = if ws.label.trim().is_empty() {
+            workspace_base_name(&path)
+        } else {
+            ws.label.trim().to_string()
+        };
+        if ws.id != id || ws.label != label || ws.path != path {
+            changed = true;
+        }
+        ws.id = id;
+        ws.label = label;
+        ws.path = path;
+        deduped.push(ws);
+    }
+
+    settings.workspaces = deduped;
 
     changed
 }
@@ -955,12 +1742,18 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
             settings.accounts.push(AccountProfile {
                 id,
                 label: label_from_codex_dir(name),
+                provider: Provider::Codex,
                 codex_home: path_string.clone(),
                 project_dir: None,
                 proxy_id,
                 startup_command: None,
                 limits: AccountLimitTracking::default(),
                 bypass: bypass_default,
+                // Ce CODEX_HOME existait deja avant sa decouverte : ne pas
+                // ecraser un modele/effort potentiellement defini dans son
+                // config.toml. L'utilisateur pourra les choisir dans l'UI.
+                model: None,
+                reasoning_effort: None,
             });
             account_paths.insert(normalized);
             changed = true;
@@ -1021,18 +1814,25 @@ pub fn account_has_auth_tokens(account: &AccountProfile) -> bool {
     let Ok(home) = expand_home(&account.codex_home) else {
         return false;
     };
-    let Ok(content) = fs::read_to_string(home.join("auth.json")) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    value
-        .get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(Value::as_str)
-        .map(|token| !token.is_empty())
-        .unwrap_or(false)
+    // Detection des credentials propre au provider (Codex: auth.json ;
+    // Claude: .credentials.json). Voir `provider::Provider::has_auth`.
+    account.provider.has_auth(&home)
+}
+
+/// Commande CLI a utiliser pour lancer/piloter un `provider` : commande de
+/// l'agent integre correspondant (Codex ou Claude Code), avec repli sur la
+/// commande par defaut du provider si l'agent a ete retire du registre.
+pub fn command_for_provider(settings: &AppSettings, provider: Provider) -> String {
+    settings
+        .agents
+        .iter()
+        .find(|agent| agent.provider == provider && agent.builtin)
+        .map(|agent| agent.command.trim().to_string())
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| match provider {
+            Provider::Codex => "codex".to_string(),
+            Provider::Claude => "claude".to_string(),
+        })
 }
 
 fn sync_account_limit_trackers(settings: &mut AppSettings) -> bool {
@@ -1097,15 +1897,46 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     let mut buckets = Vec::new();
     let mut refreshed_at = None;
     let mut error = None;
+    let mut source = "none";
 
     if has_tokens {
+        let local_snapshot = read_local_rate_limit_snapshot(account).ok().flatten();
         match read_server_rate_limits(account, settings) {
             Ok(server_buckets) => {
-                buckets = server_buckets;
-                refreshed_at = Some(now);
+                let (merged, used_local_snapshot) = merge_rate_limit_buckets(
+                    server_buckets,
+                    local_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.buckets.as_slice()),
+                    now,
+                );
+                buckets = merged;
+                if used_local_snapshot {
+                    refreshed_at = local_snapshot.as_ref().map(|snapshot| snapshot.observed_at);
+                    source = "session";
+                } else {
+                    refreshed_at = Some(now);
+                    source = if buckets.is_empty() {
+                        "server-empty"
+                    } else {
+                        "server"
+                    };
+                }
             }
             Err(message) => {
-                error = Some(message);
+                if let Some(snapshot) = local_snapshot {
+                    buckets = valid_local_rate_limit_buckets(&snapshot.buckets, now);
+                    if buckets.is_empty() {
+                        error = Some(message);
+                        source = "unavailable";
+                    } else {
+                        refreshed_at = Some(snapshot.observed_at);
+                        source = "session";
+                    }
+                } else {
+                    error = Some(message);
+                    source = "unavailable";
+                }
             }
         }
     }
@@ -1114,16 +1945,6 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     let weekly_bucket = bucket_for_window(&buckets, WEEKLY_LIMIT_MINS);
     let session_reset_at = session_bucket.map(|bucket| bucket.resets_at);
     let weekly_reset_at = weekly_bucket.map(|bucket| bucket.resets_at);
-    let source = if !has_tokens {
-        "none"
-    } else if error.is_some() {
-        "unavailable"
-    } else if buckets.is_empty() {
-        "server-empty"
-    } else {
-        "server"
-    };
-
     AccountLimitView {
         id: account.id.clone(),
         label: account.label.clone(),
@@ -1151,6 +1972,403 @@ fn bucket_for_window(
         .iter()
         .filter(|bucket| bucket.window_duration_mins == window_duration_mins)
         .min_by_key(|bucket| bucket.resets_at)
+}
+
+/// Catalogue officiel du CLI pour le compte selectionne. `model/list` est la
+/// source de verite : chaque modele fournit sa propre liste d'intensites. Le
+/// cache local reste un fallback pour les anciens CLI ou une machine hors
+/// ligne, avec le meme resultat normalise cote frontend.
+pub fn load_account_model_catalog(account_id: &str) -> Result<Vec<AccountModelView>, String> {
+    let settings = load_settings_for_terminal()?;
+    let account = settings
+        .accounts
+        .iter()
+        .find(|candidate| candidate.id == account_id)
+        .cloned()
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+    if account.provider != Provider::Codex {
+        return Ok(Vec::new());
+    }
+
+    let app_server_result = read_model_catalog_from_app_server(&account, &settings);
+    if let Ok(result) = app_server_result.as_ref() {
+        let models = parse_account_model_catalog(result);
+        if !models.is_empty() {
+            return Ok(models);
+        }
+    }
+
+    let home = expand_home(&account.codex_home)?;
+    let cache_path = home.join("models_cache.json");
+    if let Ok(content) = fs::read_to_string(&cache_path) {
+        if let Ok(value) = serde_json::from_str::<Value>(&content) {
+            let models = parse_account_model_catalog(&value);
+            if !models.is_empty() {
+                return Ok(models);
+            }
+        }
+    }
+
+    Err(app_server_result
+        .err()
+        .unwrap_or_else(|| "Catalogue de modeles Codex indisponible".to_string()))
+}
+
+fn read_model_catalog_from_app_server(
+    account: &AccountProfile,
+    settings: &AppSettings,
+) -> Result<Value, String> {
+    let codex_home = expand_home(&account.codex_home)?;
+    let mut command = codex_app_server_command(settings);
+    command
+        .env("CODEX_HOME", codex_home.to_string_lossy().to_string())
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    if let Some(proxy_url) = proxy_url_for_account(account, settings) {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env(key, proxy_url.clone());
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("codex app-server impossible: {error}"))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return Err("stdin app-server indisponible".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err("stdout app-server indisponible".to_string());
+    };
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let requests = [
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "codex_switch_terminal",
+                    "title": "Codex Switch Terminal",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+        json!({ "method": "initialized", "params": {} }),
+        json!({
+            "method": "model/list",
+            "id": 2,
+            "params": { "limit": 100, "includeHidden": false }
+        }),
+    ];
+    for request in requests {
+        if let Err(error) = writeln!(stdin, "{request}") {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("ecriture app-server impossible: {error}"));
+        }
+    }
+    let _ = stdin.flush();
+
+    let response = loop {
+        match rx.recv_timeout(Duration::from_secs(MODEL_CATALOG_TIMEOUT_SECS)) {
+            Ok(line) => {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if value.get("id").and_then(Value::as_i64) == Some(2) {
+                    break value;
+                }
+            }
+            Err(_) => {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("timeout lecture catalogue de modeles".to_string());
+            }
+        }
+    };
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(error) = response.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("erreur app-server")
+            .to_string());
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "reponse app-server sans result".to_string())
+}
+
+fn parse_account_model_catalog(value: &Value) -> Vec<AccountModelView> {
+    let entries = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array);
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .filter(|entry| entry.get("hidden").and_then(Value::as_bool) != Some(true))
+        .filter(|entry| {
+            entry
+                .get("visibility")
+                .and_then(Value::as_str)
+                .is_none_or(|visibility| visibility == "list")
+        })
+        .filter_map(|entry| {
+            let id = entry
+                .get("id")
+                .or_else(|| entry.get("model"))
+                .or_else(|| entry.get("slug"))
+                .and_then(Value::as_str)?
+                .trim()
+                .to_string();
+            if id.is_empty() || !seen.insert(id.clone()) {
+                return None;
+            }
+            let display_name = entry
+                .get("displayName")
+                .or_else(|| entry.get("display_name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            let default_reasoning_effort = entry
+                .get("defaultReasoningEffort")
+                .or_else(|| entry.get("default_reasoning_level"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let supported_reasoning_efforts = entry
+                .get("supportedReasoningEfforts")
+                .or_else(|| entry.get("supported_reasoning_levels"))
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(|effort| {
+                            let reasoning_effort = effort
+                                .get("reasoningEffort")
+                                .or_else(|| effort.get("effort"))
+                                .and_then(Value::as_str)?
+                                .to_string();
+                            let description = effort
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            Some(ModelReasoningEffortView {
+                                reasoning_effort,
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AccountModelView {
+                id,
+                display_name,
+                default_reasoning_effort,
+                supported_reasoning_efforts,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct LocalRateLimitSnapshot {
+    buckets: Vec<AccountRateLimitBucketView>,
+    observed_at: i64,
+}
+
+/// Codex ecrit la mesure de quota effectivement appliquee a chaque tour dans
+/// ses rollouts. Cette mesure est indispensable en secours : certaines
+/// versions de `account/rateLimits/read` peuvent renvoyer momentanement une
+/// nouvelle fenetre vide (`0 %`) alors qu'une session active recoit encore la
+/// vraie consommation du compte.
+fn read_local_rate_limit_snapshot(
+    account: &AccountProfile,
+) -> Result<Option<LocalRateLimitSnapshot>, String> {
+    let codex_home = expand_home(&account.codex_home)?;
+    let mut files = Vec::new();
+    collect_rate_limit_rollouts(&codex_home.join("sessions"), &mut files);
+    collect_rate_limit_rollouts(&codex_home.join("sessions-archive"), &mut files);
+
+    let mut latest = None;
+    for path in files {
+        let Some(snapshot) = scan_rollout_rate_limit_snapshot(&path) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .map(|current: &LocalRateLimitSnapshot| snapshot.observed_at > current.observed_at)
+            .unwrap_or(true)
+        {
+            latest = Some(snapshot);
+        }
+    }
+
+    Ok(latest)
+}
+
+fn collect_rate_limit_rollouts(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rate_limit_rollouts(&path, files);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            .unwrap_or(false)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn scan_rollout_rate_limit_snapshot(path: &Path) -> Option<LocalRateLimitSnapshot> {
+    let file = fs::File::open(path).ok()?;
+    let fallback_timestamp = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let mut latest = None;
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"rate_limits\"") && !line.contains("\"rateLimits\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(limit) = value
+            .pointer("/payload/rate_limits")
+            .or_else(|| value.pointer("/payload/rateLimits"))
+            .filter(|limit| !limit.is_null())
+        else {
+            continue;
+        };
+
+        let mut buckets = Vec::new();
+        collect_rate_limit_object(limit, &mut buckets);
+        normalize_rate_limit_buckets(&mut buckets);
+        if buckets.is_empty() {
+            continue;
+        }
+
+        let observed_at = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.timestamp())
+            .unwrap_or(fallback_timestamp);
+        if latest
+            .as_ref()
+            .map(|current: &LocalRateLimitSnapshot| observed_at > current.observed_at)
+            .unwrap_or(true)
+        {
+            latest = Some(LocalRateLimitSnapshot {
+                buckets,
+                observed_at,
+            });
+        }
+    }
+
+    latest
+}
+
+fn valid_local_rate_limit_buckets(
+    buckets: &[AccountRateLimitBucketView],
+    now: i64,
+) -> Vec<AccountRateLimitBucketView> {
+    let mut valid = buckets
+        .iter()
+        .filter(|bucket| bucket.resets_at > now)
+        .cloned()
+        .collect::<Vec<_>>();
+    normalize_rate_limit_buckets(&mut valid);
+    valid
+}
+
+/// Fusion monotone : tant que la fenetre locale n'est pas expiree, une lecture
+/// reseau a 0 % ne doit jamais effacer une consommation positive observee par
+/// une vraie session Codex. Les nouvelles fenetres absentes de la reponse
+/// serveur (notamment la fenetre courte) sont egalement conservees.
+fn merge_rate_limit_buckets(
+    mut server_buckets: Vec<AccountRateLimitBucketView>,
+    local_buckets: Option<&[AccountRateLimitBucketView]>,
+    now: i64,
+) -> (Vec<AccountRateLimitBucketView>, bool) {
+    let mut used_local_snapshot = false;
+
+    for local in local_buckets
+        .into_iter()
+        .flatten()
+        .filter(|bucket| bucket.resets_at > now)
+    {
+        let matching = server_buckets.iter().position(|server| {
+            server.limit_id == local.limit_id
+                && server.bucket == local.bucket
+                && server.window_duration_mins == local.window_duration_mins
+        });
+        match matching {
+            Some(index) => {
+                let server_used = server_buckets[index].used_percent.unwrap_or(-1.0);
+                let local_used = local.used_percent.unwrap_or(-1.0);
+                if local_used > server_used {
+                    server_buckets[index] = local.clone();
+                    used_local_snapshot = true;
+                }
+            }
+            None => {
+                server_buckets.push(local.clone());
+                used_local_snapshot = true;
+            }
+        }
+    }
+
+    normalize_rate_limit_buckets(&mut server_buckets);
+    (server_buckets, used_local_snapshot)
 }
 
 fn read_server_rate_limits(
@@ -1273,6 +2491,12 @@ fn read_server_rate_limits(
         .get("result")
         .ok_or_else(|| "reponse app-server sans result".to_string())?;
     let mut buckets = extract_rate_limit_buckets(result);
+    normalize_rate_limit_buckets(&mut buckets);
+
+    Ok(buckets)
+}
+
+fn normalize_rate_limit_buckets(buckets: &mut Vec<AccountRateLimitBucketView>) {
     buckets.sort_by(|a, b| {
         (
             a.limit_id.as_str(),
@@ -1293,8 +2517,6 @@ fn read_server_rate_limits(
             && a.window_duration_mins == b.window_duration_mins
             && a.resets_at == b.resets_at
     });
-
-    Ok(buckets)
 }
 
 fn codex_app_server_command(settings: &AppSettings) -> Command {
@@ -1340,11 +2562,18 @@ fn proxy_url_for_account(account: &AccountProfile, settings: &AppSettings) -> Op
 fn extract_rate_limit_buckets(result: &Value) -> Vec<AccountRateLimitBucketView> {
     let mut buckets = Vec::new();
 
-    if let Some(limit) = result.get("rateLimits") {
+    if let Some(limit) = result
+        .get("rateLimits")
+        .or_else(|| result.get("rate_limits"))
+    {
         collect_rate_limit_object(limit, &mut buckets);
     }
 
-    if let Some(map) = result.get("rateLimitsByLimitId").and_then(Value::as_object) {
+    if let Some(map) = result
+        .get("rateLimitsByLimitId")
+        .or_else(|| result.get("rate_limits_by_limit_id"))
+        .and_then(Value::as_object)
+    {
         for limit in map.values() {
             collect_rate_limit_object(limit, &mut buckets);
         }
@@ -1356,19 +2585,23 @@ fn extract_rate_limit_buckets(result: &Value) -> Vec<AccountRateLimitBucketView>
 fn collect_rate_limit_object(limit: &Value, buckets: &mut Vec<AccountRateLimitBucketView>) {
     let limit_id = limit
         .get("limitId")
+        .or_else(|| limit.get("limit_id"))
         .and_then(Value::as_str)
         .unwrap_or("codex")
         .to_string();
     let limit_name = limit
         .get("limitName")
+        .or_else(|| limit.get("limit_name"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
     let reached_type = limit
         .get("rateLimitReachedType")
+        .or_else(|| limit.get("rate_limit_reached_type"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
     let plan_type = limit
         .get("planType")
+        .or_else(|| limit.get("plan_type"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
 
@@ -1380,11 +2613,18 @@ fn collect_rate_limit_object(limit: &Value, buckets: &mut Vec<AccountRateLimitBu
             continue;
         }
 
-        let Some(window_duration_mins) = bucket.get("windowDurationMins").and_then(Value::as_i64)
+        let Some(window_duration_mins) = bucket
+            .get("windowDurationMins")
+            .or_else(|| bucket.get("window_minutes"))
+            .and_then(Value::as_i64)
         else {
             continue;
         };
-        let Some(resets_at) = bucket.get("resetsAt").and_then(Value::as_i64) else {
+        let Some(resets_at) = bucket
+            .get("resetsAt")
+            .or_else(|| bucket.get("resets_at"))
+            .and_then(Value::as_i64)
+        else {
             continue;
         };
 
@@ -1394,7 +2634,10 @@ fn collect_rate_limit_object(limit: &Value, buckets: &mut Vec<AccountRateLimitBu
             bucket: bucket_name.to_string(),
             window_duration_mins,
             resets_at,
-            used_percent: bucket.get("usedPercent").and_then(json_f64),
+            used_percent: bucket
+                .get("usedPercent")
+                .or_else(|| bucket.get("used_percent"))
+                .and_then(json_f64),
             rate_limit_reached_type: reached_type.clone(),
             plan_type: plan_type.clone(),
         });
@@ -1430,12 +2673,11 @@ fn import_single_account(
         return Ok(());
     }
 
-    let home = if let Some(value) = env::var_os("CST_DATA_DIR") {
-        PathBuf::from(value)
+    let home = match accounts_root_opt() {
+        Some(base) => base
             .join("codex-homes")
-            .join(format!("pool-{}", account.alias))
-    } else {
-        home_dir()?.join(format!(".codex-pool-{}", account.alias))
+            .join(format!("pool-{}", account.alias)),
+        None => home_dir()?.join(format!(".codex-pool-{}", account.alias)),
     };
     fs::create_dir_all(&home).map_err(|error| error.to_string())?;
 
@@ -1482,7 +2724,7 @@ fn import_single_account(
     // Compte importe : herite du defaut global "Bypass defaut" (comme la
     // creation via l'UI / newAccountProfile), pas un `true` code en dur.
     let bypass_default = settings.codex_bypass;
-    match settings
+    let (bypass_enabled, model, reasoning_effort) = match settings
         .accounts
         .iter_mut()
         .find(|candidate| candidate.id == id)
@@ -1492,18 +2734,39 @@ fn import_single_account(
             existing.codex_home = home_string;
             existing.proxy_id = proxy_id;
             touch_account_limits(&mut existing.limits, now);
+            (
+                existing.bypass,
+                existing.model.clone(),
+                existing.reasoning_effort.clone(),
+            )
         }
-        None => settings.accounts.push(AccountProfile {
-            id,
-            label: account.label,
-            codex_home: home_string,
-            project_dir: None,
-            proxy_id,
-            startup_command: None,
-            limits: new_connected_limits(now),
-            bypass: bypass_default,
-        }),
-    }
+        None => {
+            let model = Some(DEFAULT_ACCOUNT_MODEL.to_string());
+            let reasoning_effort = Some(DEFAULT_ACCOUNT_REASONING_EFFORT.to_string());
+            settings.accounts.push(AccountProfile {
+                id,
+                label: account.label,
+                provider: Provider::Codex,
+                codex_home: home_string,
+                project_dir: None,
+                proxy_id,
+                startup_command: None,
+                limits: new_connected_limits(now),
+                bypass: bypass_default,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+            });
+            (bypass_default, model, reasoning_effort)
+        }
+    };
+
+    ensure_codex_account_config(
+        &home,
+        bypass_enabled,
+        model.as_deref(),
+        reasoning_effort.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
 
     Ok(())
 }
@@ -1853,32 +3116,76 @@ fn now_iso8601() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// Ecrit (idempotent) le "bypass" permanent de Codex dans le `config.toml` du
-/// CODEX_HOME : `approval_policy = "never"` et `sandbox_mode = "danger-full-access"`.
+/// Synchronise (idempotent) les reglages Codex propres a un compte.
 ///
-/// Contrairement au flag `--dangerously-bypass-approvals-and-sandbox` (ajoute
-/// uniquement quand l'app lance elle-meme Codex, et seulement pour l'agent Codex
-/// integre), ces cles s'appliquent quel que soit le mode de lancement : bouton
-/// Run, `codex resume`, ou saisie manuelle dans le terminal. Resultat : plus
-/// aucune demande d'approbation ni d'ecran de confiance de dossier.
+/// Le choix bypass est toujours materialise explicitement : le desactiver remet
+/// `approval_policy = "on-request"` et `sandbox_mode = "workspace-write"`, ce
+/// qui neutralise un ancien bypass persiste dans le meme `config.toml`. Le
+/// modele et l'intensite ne sont touches que lorsqu'une valeur non vide est
+/// fournie, afin de préserver les profils des versions anterieures (`None`).
 ///
-/// Best-effort et non destructif : si une cle existe deja au niveau racine, sa
-/// valeur est remplacee ; les autres entrees du fichier (dont `[mcp_servers.*]`)
-/// sont preservees. Ecriture atomique.
-pub fn ensure_codex_bypass_config(home: &Path) -> std::io::Result<()> {
+/// Les autres entrees du fichier (dont `[mcp_servers.*]`) sont preservees et
+/// l'ecriture est atomique. Les valeurs sont echappees comme des chaines TOML :
+/// un nom de modele fourni par l'UI ne peut donc pas injecter une nouvelle cle.
+pub fn ensure_codex_account_config(
+    home: &Path,
+    bypass: bool,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> std::io::Result<()> {
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    let reasoning_effort = reasoning_effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(effort) = reasoning_effort {
+        if !is_valid_reasoning_effort(effort) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Intensite de raisonnement invalide: {effort}"),
+            ));
+        }
+    }
+
+    fs::create_dir_all(home)?;
     let path = home.join("config.toml");
     let existing = fs::read_to_string(&path).unwrap_or_default();
 
-    let updated = upsert_top_level_string(&existing, "approval_policy", "never");
-    let updated = upsert_top_level_string(&updated, "sandbox_mode", "danger-full-access");
+    let approval_policy = if bypass { "never" } else { "on-request" };
+    let sandbox_mode = if bypass {
+        "danger-full-access"
+    } else {
+        "workspace-write"
+    };
+    let mut updated = upsert_top_level_string(&existing, "approval_policy", approval_policy);
+    updated = upsert_top_level_string(&updated, "sandbox_mode", sandbox_mode);
+    if let Some(model) = model {
+        updated = upsert_top_level_string(&updated, "model", model);
+    }
+    if let Some(effort) = reasoning_effort {
+        updated = upsert_top_level_string(&updated, "model_reasoning_effort", effort);
+    }
 
     if updated == existing {
         return Ok(());
     }
 
-    let tmp = home.join("config.toml.cst-tmp");
-    fs::write(&tmp, updated)?;
-    fs::rename(&tmp, &path)
+    crate::fs_util::atomic_write(&path, updated)
+}
+
+/// Le catalogue Codex est la source de verite des valeurs disponibles. Cette
+/// validation ne maintient donc pas de whitelist fonctionnelle : elle bloque
+/// uniquement les valeurs dangereuses/mal formees avant l'ecriture TOML ou le
+/// passage au CLI, ce qui rend les futurs efforts compatibles sans mise a jour.
+pub(crate) fn is_valid_reasoning_effort(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && value.chars().count() <= 32
+        && chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-')
+        })
 }
 
 /// Insere ou remplace une cle scalaire chaine AU NIVEAU RACINE d'un document TOML
@@ -1892,7 +3199,7 @@ pub fn ensure_codex_bypass_config(home: &Path) -> std::io::Result<()> {
 /// d'une valeur avec une structure top-level (ce qui pourrait dupliquer une cle
 /// et corrompre le fichier).
 fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
-    let desired = format!("{key} = \"{value}\"");
+    let desired = format!("{key} = \"{}\"", escape_toml_basic_string(value));
     let mut out = String::with_capacity(content.len() + desired.len() + 1);
     let mut replaced = false;
     let mut in_table = false;
@@ -1940,6 +3247,34 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
     } else {
         format!("{desired}\n{content}")
     }
+}
+
+/// Echappe une valeur pour une chaine TOML basique delimitee par `"`. Les
+/// retours a la ligne restent ainsi dans la valeur et ne peuvent pas devenir
+/// des cles TOML au niveau racine.
+fn escape_toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000C}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            control if control.is_control() => {
+                let codepoint = control as u32;
+                if codepoint <= 0xFFFF {
+                    escaped.push_str(&format!("\\u{codepoint:04X}"));
+                } else {
+                    escaped.push_str(&format!("\\U{codepoint:08X}"));
+                }
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Fait avancer l'etat de lexing TOML (chaine multi-ligne ouverte, profondeur de
@@ -2019,23 +3354,17 @@ pub fn expand_home(value: &str) -> Result<PathBuf, String> {
     }
 
     if let Some(stripped) = value.strip_prefix("%CST_DATA_DIR%") {
-        let base = env::var_os("CST_DATA_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
+        let base = accounts_prefix_base()?;
         return Ok(base.join(stripped.trim_start_matches(['\\', '/'])));
     }
 
     if let Some(stripped) = value.strip_prefix("${CST_DATA_DIR}") {
-        let base = env::var_os("CST_DATA_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
+        let base = accounts_prefix_base()?;
         return Ok(base.join(stripped.trim_start_matches(['\\', '/'])));
     }
 
     if let Some(stripped) = value.strip_prefix("$CST_DATA_DIR") {
-        let base = env::var_os("CST_DATA_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
+        let base = accounts_prefix_base()?;
         return Ok(base.join(stripped.trim_start_matches(['\\', '/'])));
     }
 
@@ -2089,5 +3418,105 @@ fn default_shell() -> String {
         "powershell.exe".to_string()
     } else {
         env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    }
+}
+
+#[cfg(test)]
+mod delete_home_tests {
+    use super::*;
+
+    /// Base temporaire unique par test (pas de `Date`/`rand` : nom fixe + nettoyage).
+    fn scratch(tag: &str) -> PathBuf {
+        let base = env::temp_dir()
+            .join("cst-remove-account-tests")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create scratch dir");
+        base
+    }
+
+    #[test]
+    fn guard_accepts_codex_like_dir_name() {
+        let base = scratch("codex-like");
+        let dir = base.join(".codex-pool-alpha");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_accepts_dir_with_auth_marker() {
+        let base = scratch("marker");
+        // Nom quelconque, mais contient un auth.json => reconnu comme CODEX_HOME.
+        let dir = base.join("some-random-name");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("auth.json"), "{}").unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_accepts_dir_under_codex_homes() {
+        let base = scratch("codex-homes");
+        let dir = base.join("codex-homes").join("pool-beta");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_rejects_non_codex_dir() {
+        let base = scratch("non-codex");
+        let dir = base.join("my-documents");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_rejects_user_home() {
+        let home = home_dir().expect("home dir");
+        assert!(guard_deletable_codex_home(&home).is_err());
+    }
+
+    #[test]
+    fn guard_rejects_ancestor_of_home() {
+        let home = home_dir().expect("home dir");
+        if let Some(parent) = home.parent() {
+            assert!(guard_deletable_codex_home(parent).is_err());
+        }
+    }
+
+    #[test]
+    fn delete_missing_dir_is_ok() {
+        let base = scratch("missing");
+        let missing = base.join(".codex-does-not-exist");
+        assert!(delete_codex_home_dir(&missing.to_string_lossy()).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_removes_codex_home_dir() {
+        let base = scratch("delete-ok");
+        let dir = base.join(".codex-pool-gamma");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("auth.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+
+        delete_codex_home_dir(&dir.to_string_lossy()).expect("delete should succeed");
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_refuses_and_keeps_non_codex_dir() {
+        let base = scratch("delete-refuse");
+        let dir = base.join("important-stuff");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("data.txt"), "keep me").unwrap();
+
+        assert!(delete_codex_home_dir(&dir.to_string_lossy()).is_err());
+        assert!(dir.exists(), "un dossier refuse ne doit pas etre efface");
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -36,14 +36,22 @@ axum = { version = "0.7", features = ["json", "ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2"] }
 futures-util = "0.3"
+fs2 = "0.4"
 async-stream = "0.3"
 bytes = "1"
 base64 = "0.22"
+sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rfd = "0.15"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [patch.crates-io]
 tauri-utils = { path = "vendor/tauri-utils-2.9.3" }

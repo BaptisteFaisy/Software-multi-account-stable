@@ -199,6 +199,13 @@ impl PoolManager {
     pub fn build(settings: &AppSettings) -> Result<Self, String> {
         let mut accounts = Vec::with_capacity(settings.accounts.len());
         for profile in &settings.accounts {
+            // Le pool est un proxy OpenAI-compatible adosse a ChatGPT : il ne sait
+            // lire que les credentials Codex (auth.json). On EXCLUT donc les
+            // comptes d'autres providers (Claude) pour ne pas les mal-charger
+            // (tokens vides -> comptes "Missing" parasites dans le pool/UI).
+            if profile.provider != crate::settings::Provider::Codex {
+                continue;
+            }
             accounts.push(load_account(profile, settings));
         }
         Ok(PoolManager {
@@ -533,13 +540,11 @@ fn persist_auth(home: &std::path::Path, refreshed: &Refreshed) -> Result<(), Str
         tokens["refresh_token"] = serde_json::Value::String(refreshed.refresh_token.clone());
     }
     value["last_refresh"] = serde_json::Value::String(now_rfc3339());
-    let tmp = home.join("auth.json.pool-tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &auth_path).map_err(|e| e.to_string())
+    // Ecriture atomique via un temporaire UNIQUE (PID+UUID) : deux process CST
+    // partageant le meme codex-homes ne peuvent pas se dechirer mutuellement le
+    // auth.json lors d'un refresh concurrent (last-writer-wins, jamais corrompu).
+    let serialized = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    crate::fs_util::atomic_write(&auth_path, serialized.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Horodatage RFC 3339 attendu par Codex CLI pour `last_refresh` dans
@@ -717,7 +722,33 @@ fn parse_data_line(event: &str) -> Option<serde_json::Value> {
 // reponses api
 // ----------------------------------------------------------------------------
 
-pub fn router(mgr: Arc<PoolManager>) -> Router {
+#[derive(Clone)]
+struct PoolRouterState {
+    mgr: Arc<PoolManager>,
+    /// Jeton superviseur "break-glass" accepte EN PLUS de la cle API du pool :
+    /// c'est l'`admin_token` du serveur SaaS. Vaut `None` pour le pool local
+    /// desktop (qui n'ecoute qu'en loopback et n'a pas d'admin_token).
+    break_glass: Option<Arc<str>>,
+}
+
+impl PoolRouterState {
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+        authorize_pool(
+            headers,
+            self.mgr.config().api_key.as_str(),
+            self.break_glass.as_deref(),
+        )
+    }
+}
+
+pub fn router(mgr: Arc<PoolManager>, break_glass: Option<String>) -> Router {
+    let state = PoolRouterState {
+        mgr,
+        break_glass: break_glass
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+            .map(Arc::from),
+    };
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
@@ -728,20 +759,47 @@ pub fn router(mgr: Arc<PoolManager>) -> Router {
         // `/healthz` faisait paniquer axum au demarrage ("Overlapping method
         // route. Handler for `GET /healthz` already exists").
         .layer(CorsLayer::very_permissive())
-        .with_state(mgr)
+        .with_state(state)
 }
 
-fn check_api_key(headers: &HeaderMap, config: &PoolConfig) -> Result<(), (StatusCode, String)> {
-    let expected = config.api_key.trim();
-    if expected.is_empty() {
+/// Autorisation des routes du pool (proxy OpenAI-compatible).
+///
+/// Accepte la requete si le Bearer correspond a la cle API du pool (quand elle
+/// est configuree) OU au jeton break-glass. La comparaison couvre TOUS les
+/// credentials sans court-circuit, pour ne pas divulguer par le timing lequel a
+/// matche.
+///
+/// Cas particulier : si AUCUN credential n'est configure (pool local desktop
+/// sans cle API et sans admin_token), l'acces reste ouvert — ce proxy n'ecoute
+/// qu'en loopback par defaut. Cote SaaS, `break_glass` = `admin_token` (non
+/// vide, requis au boot), donc l'acces anonyme distant y est FERME.
+fn authorize_pool(
+    headers: &HeaderMap,
+    api_key: &str,
+    break_glass: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let mut accepted: Vec<&str> = Vec::new();
+    let api_key = api_key.trim();
+    if !api_key.is_empty() {
+        accepted.push(api_key);
+    }
+    if let Some(token) = break_glass.map(str::trim).filter(|token| !token.is_empty()) {
+        accepted.push(token);
+    }
+    if accepted.is_empty() {
         return Ok(());
     }
+
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let provided = bearer.strip_prefix("Bearer ").unwrap_or(bearer).trim();
-    if provided == expected {
+    let provided = provided.as_bytes();
+    let matched = accepted.iter().fold(false, |acc, expected| {
+        crate::security::constant_time_eq(provided, expected.as_bytes()) | acc
+    });
+    if matched {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "clé API invalide".to_string()))
@@ -755,8 +813,11 @@ fn api_error(code: StatusCode, message: &str) -> Response {
     (code, Json(body)).into_response()
 }
 
-async fn models(State(mgr): State<Arc<PoolManager>>) -> impl IntoResponse {
-    let model = mgr.config().default_model.clone();
+async fn models(State(state): State<PoolRouterState>, headers: HeaderMap) -> Response {
+    if let Err((code, msg)) = state.authorize(&headers) {
+        return api_error(code, &msg);
+    }
+    let model = state.mgr.config().default_model.clone();
     let now = now_ts();
     Json(serde_json::json!({
         "object": "list",
@@ -766,9 +827,14 @@ async fn models(State(mgr): State<Arc<PoolManager>>) -> impl IntoResponse {
             { "id": "gpt-5-codex", "object": "model", "created": now, "owned_by": "codex-pool" }
         ]
     }))
+    .into_response()
 }
 
-async fn admin_status(State(mgr): State<Arc<PoolManager>>) -> impl IntoResponse {
+async fn admin_status(State(state): State<PoolRouterState>, headers: HeaderMap) -> Response {
+    if let Err((code, msg)) = state.authorize(&headers) {
+        return api_error(code, &msg);
+    }
+    let mgr = &state.mgr;
     let views = mgr.status_view();
     let total = views.len();
     let idle = views
@@ -784,16 +850,18 @@ async fn admin_status(State(mgr): State<Arc<PoolManager>>) -> impl IntoResponse 
         "idle": idle,
         "accounts": views
     }))
+    .into_response()
 }
 
 async fn chat_completions(
-    State(mgr): State<Arc<PoolManager>>,
+    State(state): State<PoolRouterState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err((code, msg)) = check_api_key(&headers, mgr.config()) {
+    if let Err((code, msg)) = state.authorize(&headers) {
         return api_error(code, &msg);
     }
+    let mgr = &state.mgr;
 
     let chat: ChatRequest = match serde_json::from_slice(&body) {
         Ok(c) => c,
@@ -1061,5 +1129,50 @@ fn truncate(value: &str, max: usize) -> String {
         value.to_string()
     } else {
         format!("{}…", &value[..max])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn saas_pool_rejects_anonymous_even_with_empty_api_key() {
+        // Cote SaaS, break_glass = admin_token (non vide) : l'acces anonyme est
+        // ferme meme quand la cle API du pool n'est pas configuree (defaut).
+        assert!(authorize_pool(&HeaderMap::new(), "", Some("admin-secret")).is_err());
+        assert!(authorize_pool(&bearer("nope"), "", Some("admin-secret")).is_err());
+        // Le jeton break-glass (admin_token) est accepte.
+        assert!(authorize_pool(&bearer("admin-secret"), "", Some("admin-secret")).is_ok());
+    }
+
+    #[test]
+    fn saas_pool_accepts_api_key_or_admin_token() {
+        assert!(authorize_pool(&bearer("api-key"), "api-key", Some("admin-secret")).is_ok());
+        assert!(authorize_pool(&bearer("admin-secret"), "api-key", Some("admin-secret")).is_ok());
+        assert!(authorize_pool(&bearer("wrong"), "api-key", Some("admin-secret")).is_err());
+    }
+
+    #[test]
+    fn local_pool_without_credentials_stays_open() {
+        // Pool local desktop : ni cle API, ni break-glass -> ouvert (loopback).
+        // On ne casse pas les agents locaux existants.
+        assert!(authorize_pool(&HeaderMap::new(), "", None).is_ok());
+    }
+
+    #[test]
+    fn local_pool_with_api_key_is_enforced() {
+        assert!(authorize_pool(&bearer("k"), "k", None).is_ok());
+        assert!(authorize_pool(&HeaderMap::new(), "k", None).is_err());
+        assert!(authorize_pool(&bearer("bad"), "k", None).is_err());
     }
 }

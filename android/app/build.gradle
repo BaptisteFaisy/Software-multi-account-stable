@@ -1,0 +1,35 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.codexswitch.terminal'
+    compileSdk 36
+    // Version de build-tools reellement installee sur ce poste (evite qu'AGP
+    // tente de telecharger une autre version via un sdkmanager absent).
+    buildToolsVersion "36.1.0"
+
+    defaultConfig {
+        applicationId "com.codexswitch.terminal"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

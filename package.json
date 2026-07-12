@@ -13,6 +13,9 @@
     "web:local:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-local-server.ps1",
     "build": "tauri build",
     "build:frontend": "tsc && vite build",
+    "test:frontend": "node --test tests/*.test.mjs",
+    "test:ios": "node --test tests/ios-client.test.mjs",
+    "test:pwa": "node --test tests/pwa.test.mjs",
     "build:server": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin cst-server",
     "preview": "vite preview"
   },

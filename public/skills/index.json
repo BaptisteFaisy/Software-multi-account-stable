@@ -1,0 +1,47 @@
+{
+  "skills": [
+    {
+      "id": "thermo-nuclear-code-quality-review",
+      "file": "thermo-nuclear-code-quality-review.md",
+      "name": "thermo-nuclear-code-quality-review",
+      "description": "Use for EVERY code review and before every commit or PR in this project (app + website) — an extremely strict maintainability audit: abstraction quality, files crossing 1000 lines, spaghetti conditionals, boundary/type cleanliness, and ambitious \"code judo\" simplifications. Apply any time you write, refactor, or restructure code.",
+      "tags": [
+        "code-quality",
+        "review",
+        "maintainability",
+        "refactoring",
+        "always-on"
+      ]
+    },
+    {
+      "id": "impeccable",
+      "file": "impeccable.md",
+      "name": "impeccable",
+      "description": "Use when designing, redesigning, critiquing, auditing, polishing, distilling, hardening, or otherwise improving a frontend interface — websites, landing pages, dashboards, product UI, app shells, components, forms, onboarding, empty states. Covers visual hierarchy, spacing, layout, color, typography, fonts, motion/micro-interactions, accessibility, responsive behavior, theming, anti-patterns/AI-slop, and design systems/tokens. In THIS project it also backs the toolbar \"Audit\" button (the Impeccable browser detector). Not for backend-only or non-UI tasks.",
+      "tags": [
+        "design",
+        "ui",
+        "frontend",
+        "audit",
+        "anti-patterns",
+        "impeccable",
+        "accessibility"
+      ]
+    },
+    {
+      "id": "make-interfaces-feel-better",
+      "file": "make-interfaces-feel-better.md",
+      "name": "make-interfaces-feel-better",
+      "description": "Design engineering principles for making interfaces feel polished. Use when building UI components, reviewing frontend code, implementing animations, hover states, shadows, borders, typography, micro-interactions, enter/exit animations, or any visual detail work. Triggers on UI polish, design details, \"make it feel better\", \"feels off\", stagger animations, border radius, optical alignment, font smoothing, tabular numbers, image outlines, box shadows.",
+      "tags": [
+        "design",
+        "ui",
+        "frontend",
+        "polish",
+        "animations",
+        "typography",
+        "micro-interactions"
+      ]
+    }
+  ]
+}

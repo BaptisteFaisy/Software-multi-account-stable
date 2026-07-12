@@ -1,0 +1,86 @@
+# Compile le client iOS sur un Mac GitHub, sans signature Apple.
+# Le .app produit cible le simulateur : il prouve que le projet Xcode compile,
+# mais ne peut pas etre installe sur un iPhone/iPad physique.
+
+name: iOS - Build distant
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-simulator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-simulator:
+    name: Compiler avec Xcode
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+
+      - name: Versions du Mac distant
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Verifier la web app et le projet iOS
+        run: |
+          npm ci
+          npm run test:frontend
+          npm run build:frontend
+
+      - name: Compiler l'application pour le simulateur
+        run: bash scripts/build-ios.sh simulator
+
+      - name: Empaqueter le resultat Xcode
+        run: |
+          set -euo pipefail
+          products="ios/build/DerivedData/Build/Products/Debug-iphonesimulator"
+          app_path="$(find "$products" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo "::error::Aucun bundle .app produit par Xcode."
+            exit 1
+          fi
+
+          mkdir -p ios/build/artifacts
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app_path" ios/build/artifacts/CodexTerminal-iOS-Simulator.zip
+          shasum -a 256 ios/build/artifacts/CodexTerminal-iOS-Simulator.zip \
+            > ios/build/artifacts/CodexTerminal-iOS-Simulator.zip.sha256
+          {
+            sw_vers
+            xcodebuild -version
+            echo "Commit: $GITHUB_SHA"
+          } > ios/build/artifacts/build-info.txt
+
+      - name: Publier l'artefact du simulateur
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexTerminal-iOS-Simulator-${{ github.run_number }}
+          path: ios/build/artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Resume
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Build iOS valide
+
+          Xcode a compile le client natif avec succes. L'artefact fourni cible le
+          **simulateur iOS** et n'est pas installable sur un iPad physique.
+
+          Sur l'iPad, utilise directement la web app : Safari > Partager >
+          Sur l'ecran d'accueil > Ouvrir comme app web.
+          EOF

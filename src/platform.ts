@@ -1,8 +1,17 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { TerminalInputBuffer, terminalTransportErrorMessage } from "./terminal-transport";
 
 export type UnlistenFn = () => void;
+
+export type RealtimeConnectionState = "connecting" | "live" | "reconnecting" | "closed" | "unsupported";
+
+export type DiscussionStreamMessage =
+  | { type: "dashboard"; dashboard: unknown }
+  | { type: "transcript"; accountId: string; sessionId: string; transcript: unknown }
+  | { type: "error"; message: string }
+  | { type: "pong" };
 
 type Listener<T> = (event: { payload: T }) => void;
 
@@ -55,7 +64,7 @@ type ClientStartupConfig = {
   token?: string | null;
 };
 
-type AndroidBridge = {
+type MobileBridge = {
   getBaseUrl?: () => string;
   getToken?: () => string;
   setConfig?: (baseUrl: string, token: string) => void;
@@ -70,6 +79,13 @@ const REMOTE_NODES_KEY = "codex-switch-terminal.remote.nodes";
 const listeners = new Map<string, Set<Listener<any>>>();
 const remoteSockets = new Map<number, WebSocket>();
 const remoteTerminalRoutes = new Map<number, RemoteTerminalRoute>();
+const remoteStartingTerminals = new Set<number>();
+const remotePendingTerminalInput = new TerminalInputBuffer();
+const remoteTerminalReconnectTimers = new Map<number, number>();
+const remoteTerminalReconnectAttempts = new Map<number, number>();
+const remoteStoppingTerminals = new Set<number>();
+
+const REMOTE_TERMINAL_MAX_RECONNECTS = 6;
 
 const viteRemoteBase =
   (typeof import.meta !== "undefined" && import.meta.env?.VITE_CST_API_BASE_URL
@@ -102,13 +118,17 @@ export const remoteNodesText = () =>
 
 export const hasRemoteAuth = () => !isRemoteMode() || remoteToken().length > 0;
 
-const androidBridge = (): AndroidBridge | null => {
+const mobileBridge = (): MobileBridge | null => {
   if (typeof window === "undefined") return null;
-  return ((window as Window & { CstAndroid?: AndroidBridge }).CstAndroid ?? null);
+  const nativeWindow = window as Window & {
+    CstAndroid?: MobileBridge;
+    CstIOS?: MobileBridge;
+  };
+  return nativeWindow.CstIOS ?? nativeWindow.CstAndroid ?? null;
 };
 
-const readAndroidBridgeConfig = () => {
-  const bridge = androidBridge();
+const readMobileBridgeConfig = () => {
+  const bridge = mobileBridge();
   if (!bridge) return null;
 
   try {
@@ -137,21 +157,21 @@ export const saveRemoteConfig = (baseUrl: string, token: string, nodesText?: str
   }
 
   try {
-    androidBridge()?.setConfig?.(normalizedBaseUrl, normalizedToken);
+    mobileBridge()?.setConfig?.(normalizedBaseUrl, normalizedToken);
   } catch {
-    // The Android bridge is optional; localStorage remains the source of truth for web.
+    // Les ponts Android/iOS sont optionnels ; localStorage reste la source web.
   }
 };
 
 export const initializePlatform = async () => {
-  const androidConfig = readAndroidBridgeConfig();
-  if (androidConfig?.baseUrl || androidConfig?.token) {
+  const mobileConfig = readMobileBridgeConfig();
+  if (mobileConfig?.baseUrl || mobileConfig?.token) {
     localStorage.setItem(REMOTE_ENABLED_KEY, "1");
-    if (androidConfig.baseUrl) {
-      localStorage.setItem(REMOTE_BASE_URL_KEY, androidConfig.baseUrl.replace(/\/+$/, ""));
+    if (mobileConfig.baseUrl) {
+      localStorage.setItem(REMOTE_BASE_URL_KEY, mobileConfig.baseUrl.replace(/\/+$/, ""));
     }
-    if (androidConfig.token) {
-      localStorage.setItem(REMOTE_TOKEN_KEY, androidConfig.token);
+    if (mobileConfig.token) {
+      localStorage.setItem(REMOTE_TOKEN_KEY, mobileConfig.token);
     }
   }
 
@@ -159,7 +179,13 @@ export const initializePlatform = async () => {
 
   try {
     const config = await tauriInvoke<ClientStartupConfig>("client_startup_config");
-    if (!config.remoteMode) return;
+    if (!config.remoteMode) {
+      // L'application locale et l'application Cloud partagent le meme profil
+      // WebView. Un ancien lancement Cloud ne doit pas forcer les lancements
+      // locaux suivants a continuer d'utiliser fetch() vers ce serveur.
+      localStorage.removeItem(REMOTE_ENABLED_KEY);
+      return;
+    }
 
     localStorage.setItem(REMOTE_ENABLED_KEY, "1");
     if (config.baseUrl?.trim()) {
@@ -175,14 +201,66 @@ export const initializePlatform = async () => {
 
 export const clearRemoteConfig = () => {
   localStorage.removeItem(REMOTE_TOKEN_KEY);
+  try {
+    mobileBridge()?.setConfig?.(remoteBaseUrl(), "");
+  } catch {
+    // La deconnexion web reste effective meme si le pont natif est indisponible.
+  }
 };
 
 const tauriWindow = isTauriRuntime() ? getCurrentWindow() : null;
 
+type BrowserFullscreenDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+};
+
+type BrowserFullscreenElement = HTMLElement & {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+};
+
+const browserFullscreenElement = () => {
+  if (typeof document === "undefined") return null;
+  const fullscreenDocument = document as BrowserFullscreenDocument;
+  return document.fullscreenElement ?? fullscreenDocument.webkitFullscreenElement ?? null;
+};
+
+const setBrowserFullscreen = async (fullscreen: boolean) => {
+  if (typeof document === "undefined") {
+    throw new Error("Le plein ecran n'est pas disponible dans cet environnement.");
+  }
+
+  const fullscreenDocument = document as BrowserFullscreenDocument;
+  if (fullscreen) {
+    if (browserFullscreenElement()) return;
+    const root = document.documentElement as BrowserFullscreenElement;
+    const requestFullscreen = root.requestFullscreen?.bind(root) ??
+      root.webkitRequestFullscreen?.bind(root);
+    if (!requestFullscreen) {
+      throw new Error("Ce navigateur ne prend pas en charge le mode plein ecran.");
+    }
+    await requestFullscreen();
+    return;
+  }
+
+  if (!browserFullscreenElement()) return;
+  const exitFullscreen = document.exitFullscreen?.bind(document) ??
+    fullscreenDocument.webkitExitFullscreen?.bind(fullscreenDocument);
+  if (!exitFullscreen) {
+    throw new Error("Impossible de quitter le mode plein ecran dans ce navigateur.");
+  }
+  await exitFullscreen();
+};
+
 export const appWindow = {
-  isFullscreen: async () => (tauriWindow ? tauriWindow.isFullscreen() : false),
+  isFullscreen: async () =>
+    tauriWindow ? tauriWindow.isFullscreen() : browserFullscreenElement() !== null,
   setFullscreen: async (fullscreen: boolean) => {
-    if (tauriWindow) await tauriWindow.setFullscreen(fullscreen);
+    if (tauriWindow) {
+      await tauriWindow.setFullscreen(fullscreen);
+      return;
+    }
+    await setBrowserFullscreen(fullscreen);
   },
 };
 
@@ -196,6 +274,128 @@ export async function listen<T>(event: string, handler: Listener<T>): Promise<Un
   listeners.set(event, set);
   return () => {
     set.delete(handler);
+  };
+}
+
+/**
+ * Souscrit au flux partage des discussions du serveur. Sans options, le flux
+ * suit l'index ; avec accountId/sessionId il suit le transcript correspondant.
+ * La reconnexion est automatique (reseau mobile, sortie de veille, WebView mise
+ * en arriere-plan). Le runtime Tauri local utilise le repli par polling de
+ * main.ts, car il n'a pas de serveur HTTP a joindre.
+ */
+export function subscribeDiscussionUpdates(
+  options: { accountId?: string; sessionId?: string },
+  onMessage: (message: DiscussionStreamMessage) => void,
+  onState?: (state: RealtimeConnectionState) => void,
+): UnlistenFn {
+  if (!isRemoteMode()) {
+    onState?.("unsupported");
+    return () => undefined;
+  }
+
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let retryTimer: number | null = null;
+  let heartbeatTimer: number | null = null;
+  let retryCount = 0;
+  let lastMessageAt = 0;
+
+  const clearRetry = () => {
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  };
+
+  const clearHeartbeat = () => {
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const startHeartbeat = (target: WebSocket) => {
+    clearHeartbeat();
+    heartbeatTimer = window.setInterval(() => {
+      if (socket !== target || target.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastMessageAt > 45_000) {
+        target.close();
+        return;
+      }
+      target.send(JSON.stringify({ type: "ping" }));
+    }, 15_000);
+  };
+
+  const connect = () => {
+    if (stopped || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+    clearRetry();
+    onState?.(retryCount > 0 ? "reconnecting" : "connecting");
+
+    const route = defaultRemoteRoute();
+    const wsBase = route.baseUrl.startsWith("https://")
+      ? route.baseUrl.replace(/^https:\/\//, "wss://")
+      : route.baseUrl.replace(/^http:\/\//, "ws://");
+    const query = new URLSearchParams({ token: route.token });
+    if (options.accountId && options.sessionId) {
+      query.set("accountId", options.accountId);
+      query.set("sessionId", options.sessionId);
+    }
+
+    const next = new WebSocket(`${wsBase}/ws/discussions?${query.toString()}`);
+    socket = next;
+    next.addEventListener("open", () => {
+      if (socket !== next || stopped) return;
+      retryCount = 0;
+      lastMessageAt = Date.now();
+      startHeartbeat(next);
+      onState?.("live");
+    });
+    next.addEventListener("message", (event) => {
+      if (socket !== next || stopped) return;
+      lastMessageAt = Date.now();
+      try {
+        onMessage(JSON.parse(String(event.data)) as DiscussionStreamMessage);
+      } catch {
+        // Ignore un paquet incomplet/inconnu ; le prochain snapshot est complet.
+      }
+    });
+    next.addEventListener("close", () => {
+      if (socket === next) socket = null;
+      clearHeartbeat();
+      if (stopped) return;
+      retryCount += 1;
+      onState?.("reconnecting");
+      const delay = Math.min(10_000, 500 * 2 ** Math.min(retryCount - 1, 5));
+      retryTimer = window.setTimeout(connect, delay);
+    });
+    next.addEventListener("error", () => {
+      // `close` planifie la reconnexion et centralise les changements d'etat.
+      next.close();
+    });
+  };
+
+  const onVisibilityChange = () => {
+    if (document.visibilityState !== "visible") return;
+    if (!socket) {
+      connect();
+    } else if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "ping" }));
+    }
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  connect();
+
+  return () => {
+    stopped = true;
+    clearRetry();
+    clearHeartbeat();
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    socket?.close();
+    socket = null;
+    onState?.("closed");
   };
 }
 
@@ -214,13 +414,29 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
     case "save_settings":
       return api<T>("PUT", "/api/settings", args.settings);
     case "ensure_account_home":
-      return api<T>("POST", "/api/accounts/home", { codexHome: args.codexHome });
+      return api<T>("POST", "/api/accounts/home", {
+        codexHome: args.codexHome,
+        provider: args.provider ?? null,
+        bypass: args.bypass ?? true,
+        model: args.model ?? null,
+        reasoningEffort: args.reasoningEffort ?? null,
+      });
+    case "export_discussion_transcript":
+      return api<T>("POST", "/api/discussions/export", {
+        accountId: args.accountId,
+        sessionId: args.sessionId,
+      });
     case "import_account_json":
       return api<T>("POST", "/api/accounts/import", { content: args.content });
     case "import_account_docs":
       throw new Error("En mode SaaS, colle le contenu JSON plutot qu'un chemin de fichier local.");
     case "remove_account":
-      return api<T>("DELETE", `/api/accounts/${encodeURIComponent(args.accountId)}`);
+      return api<T>(
+        "DELETE",
+        `/api/accounts/${encodeURIComponent(args.accountId)}?deleteFiles=${
+          args.deleteFiles ? "true" : "false"
+        }`,
+      );
     case "account_limit_status":
       return api<T>("GET", "/api/limits");
     case "usage_dashboard":
@@ -249,7 +465,7 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       resizeRemoteTerminal(args.id, args.cols, args.rows);
       return undefined as T;
     case "stop_terminal":
-      stopRemoteTerminal(args.id);
+      await stopRemoteTerminal(args.id);
       return undefined as T;
     case "pick_project_dir":
       return null as T;
@@ -265,6 +481,30 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       throw new Error("Le lancement d'IDE local n'est pas disponible en mode SaaS.");
     case "list_discussions":
       return api<T>("GET", "/api/discussions");
+    case "get_discussion_transcript":
+      return api<T>(
+        "GET",
+        `/api/discussions/transcript?accountId=${encodeURIComponent(String(args.accountId))}&sessionId=${encodeURIComponent(String(args.sessionId))}`,
+      );
+    case "account_model_catalog":
+      return api<T>(
+        "GET",
+        `/api/chat/models?accountId=${encodeURIComponent(String(args.accountId))}`,
+      );
+    case "start_chat_turn":
+      return api<T>("POST", "/api/chat/turns", {
+        accountId: args.accountId,
+        sessionId: args.sessionId ?? null,
+        prompt: args.prompt,
+        projectDir: args.projectDir ?? null,
+        mode: args.mode ?? "build",
+        model: args.model ?? null,
+        reasoningEffort: args.reasoningEffort ?? null,
+      });
+    case "chat_turn_status":
+      return api<T>("GET", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
+    case "stop_chat_turn":
+      return api<T>("DELETE", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
     case "list_prompt_history":
       return {
         generatedAt: Math.floor(Date.now() / 1000),
@@ -286,6 +526,12 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         sourceAccountId: args.sourceAccountId,
         targetAccountId: args.targetAccountId,
       });
+    case "move_discussion":
+      return api<T>("POST", "/api/discussions/move", {
+        accountId: args.accountId,
+        sessionId: args.sessionId,
+        workspacePath: args.workspacePath,
+      });
     case "delete_discussion":
       return api<T>("POST", "/api/discussions/delete", {
         accountId: args.accountId,
@@ -293,19 +539,23 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         archive: args.archive,
       });
     case "room_status":
-      return api<T>("GET", "/api/room/status");
-    case "room_messages":
       return api<T>(
         "GET",
-        `/api/room/messages${args.since ? `?since=${encodeURIComponent(args.since)}` : ""}`,
+        `/api/room/status${args.workspacePath ? `?workspacePath=${encodeURIComponent(args.workspacePath)}` : ""}`,
       );
+    case "room_messages":
+      {
+        const query = new URLSearchParams();
+        if (args.since) query.set("since", String(args.since));
+        if (args.workspacePath) query.set("workspacePath", String(args.workspacePath));
+        return api<T>("GET", `/api/room/messages${query.size ? `?${query}` : ""}`);
+      }
     case "room_send":
-      return api<T>("POST", "/api/room/send", { text: args.text, to: args.to ?? null });
-    // En SaaS le salon est toujours actif (monte dans le serveur) : enable/disable
-    // cote client sont des no-op qui renvoient l'etat courant.
-    case "room_enable":
-    case "room_disable":
-      return api<T>("GET", "/api/room/status");
+      return api<T>("POST", "/api/room/send", {
+        text: args.text,
+        to: args.to ?? null,
+        workspacePath: args.workspacePath ?? null,
+      });
     default:
       throw new Error(`Commande remote non supportee: ${command}`);
   }
@@ -473,6 +723,9 @@ async function pickRemotePoolAccount<T>() {
 }
 
 async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
+  const requestedId = Number(args.id);
+  if (Number.isFinite(requestedId)) remoteStartingTerminals.add(requestedId);
+
   const payload = {
     id: args.id,
     accountId: args.accountId,
@@ -484,43 +737,74 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
     command: args.command,
     agentId: args.agentId,
   };
-  const candidates = await terminalNodeCandidates();
   let lastError: unknown = null;
 
-  for (const route of candidates) {
-    try {
-      const response = await apiAt<RemoteStartResponse>(route, "POST", "/api/terminals", payload);
-      remoteTerminalRoutes.set(response.id, route);
-      emit("pty-data", {
-        id: response.id,
-        data: `\r\n[Route] Terminal sur ${route.label} (${route.baseUrl})\r\n`,
-      });
-      openTerminalSocket(response.id, route);
-      return response.id as T;
-    } catch (error) {
-      lastError = error;
+  try {
+    const candidates = await terminalNodeCandidates();
+    for (const route of candidates) {
+      try {
+        const response = await apiAt<RemoteStartResponse>(route, "POST", "/api/terminals", payload);
+        if (Number.isFinite(requestedId) && requestedId !== response.id) {
+          movePendingTerminalInput(requestedId, response.id);
+        }
+        remoteTerminalRoutes.set(response.id, route);
+        emit("pty-data", {
+          id: response.id,
+          data: `\r\n[Route] Terminal sur ${route.label} (${route.baseUrl})\r\n`,
+        });
+        openTerminalSocket(response.id, route);
+        return response as T;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError ?? new Error("Aucun noeud terminal disponible.");
+  } finally {
+    if (Number.isFinite(requestedId)) {
+      remoteStartingTerminals.delete(requestedId);
+      if (!remoteTerminalRoutes.has(requestedId)) remotePendingTerminalInput.clear(requestedId);
     }
   }
-
-  throw lastError ?? new Error("Aucun noeud terminal disponible.");
 }
 
 function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute()) {
-  remoteSockets.get(id)?.close();
+  clearRemoteTerminalReconnectTimer(id);
+  const previous = remoteSockets.get(id);
+  if (previous && previous.readyState !== WebSocket.CLOSED) previous.close();
+
   const base = route.baseUrl;
   const wsBase = base.startsWith("https://")
     ? base.replace(/^https:\/\//, "wss://")
     : base.replace(/^http:\/\//, "ws://");
-  const socket = new WebSocket(`${wsBase}/ws/terminals/${id}?token=${encodeURIComponent(route.token)}`);
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(`${wsBase}/ws/terminals/${id}?token=${encodeURIComponent(route.token)}`);
+  } catch (error) {
+    emitTerminalTransportError(id, route, error);
+    scheduleRemoteTerminalReconnect(id, route);
+    return;
+  }
   remoteSockets.set(id, socket);
 
+  socket.addEventListener("open", () => {
+    if (remoteSockets.get(id) !== socket) return;
+    remoteTerminalReconnectAttempts.delete(id);
+    const pending = takePendingTerminalInput(id);
+    if (pending) socket.send(JSON.stringify({ type: "input", data: pending }));
+  });
+
   socket.addEventListener("message", (event) => {
+    if (remoteSockets.get(id) !== socket) return;
     const message = JSON.parse(String(event.data)) as RemoteWsMessage;
     if (message.type === "data") {
       emit("pty-data", { id: message.id, data: message.data });
     } else if (message.type === "exit") {
       remoteSockets.delete(message.id);
       remoteTerminalRoutes.delete(message.id);
+      clearRemoteTerminalReconnectTimer(message.id);
+      remoteTerminalReconnectAttempts.delete(message.id);
+      remotePendingTerminalInput.clear(message.id);
       emit("pty-exit", { id: message.id });
     } else if (message.type === "error") {
       emit("pty-data", { id: message.id, data: `\r\n${message.message}\r\n` });
@@ -532,7 +816,18 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
   });
 
   socket.addEventListener("close", () => {
+    if (remoteSockets.get(id) !== socket) return;
     remoteSockets.delete(id);
+    if (remoteStoppingTerminals.has(id) || !remoteTerminalRoutes.has(id)) return;
+    scheduleRemoteTerminalReconnect(id, route);
+  });
+
+  socket.addEventListener("error", () => {
+    try {
+      socket.close();
+    } catch {
+      scheduleRemoteTerminalReconnect(id, route);
+    }
   });
 }
 
@@ -542,9 +837,23 @@ function writeRemoteTerminal(id: number, data: string) {
     socket.send(JSON.stringify({ type: "input", data }));
     return;
   }
+
+  if (socket?.readyState === WebSocket.CONNECTING || remoteStartingTerminals.has(id)) {
+    queuePendingTerminalInput(id, data);
+    return;
+  }
+
   const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
   void apiAt(route, "POST", `/api/terminals/${id}/write`, { data }).catch((error) => {
-    emit("pty-data", { id, data: `\r\n${String(error)}\r\n` });
+    const message = terminalTransportErrorMessage(route.baseUrl, error);
+    emit("pty-data", { id, data: `\r\n${message}\r\n` });
+    if (/session terminal introuvable/i.test(String(error))) {
+      remoteTerminalRoutes.delete(id);
+      clearRemoteTerminalReconnectTimer(id);
+      remoteTerminalReconnectAttempts.delete(id);
+      remotePendingTerminalInput.clear(id);
+      emit("pty-exit", { id });
+    }
   });
 }
 
@@ -554,19 +863,85 @@ function resizeRemoteTerminal(id: number, cols: number, rows: number) {
     socket.send(JSON.stringify({ type: "resize", cols, rows }));
     return;
   }
+  if (socket?.readyState === WebSocket.CONNECTING || remoteStartingTerminals.has(id)) return;
   const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
   void apiAt(route, "POST", `/api/terminals/${id}/resize`, { cols, rows }).catch(() => undefined);
 }
 
-function stopRemoteTerminal(id: number) {
+async function stopRemoteTerminal(id: number) {
+  const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
+  remoteStoppingTerminals.add(id);
+  clearRemoteTerminalReconnectTimer(id);
+  remoteTerminalReconnectAttempts.delete(id);
+  remotePendingTerminalInput.clear(id);
   const socket = remoteSockets.get(id);
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "stop" }));
-    socket.close();
   }
-  const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
-  void apiAt(route, "DELETE", `/api/terminals/${id}`).catch(() => undefined);
+  socket?.close();
+  remoteSockets.delete(id);
   remoteTerminalRoutes.delete(id);
+  try {
+    await apiAt(route, "DELETE", `/api/terminals/${id}`);
+  } catch {
+    // La fermeture locale reste effective meme si le noeud est deja parti.
+  } finally {
+    remoteStoppingTerminals.delete(id);
+  }
+}
+
+function queuePendingTerminalInput(id: number, data: string) {
+  remotePendingTerminalInput.append(id, data);
+}
+
+function takePendingTerminalInput(id: number) {
+  return remotePendingTerminalInput.take(id);
+}
+
+function movePendingTerminalInput(from: number, to: number) {
+  remotePendingTerminalInput.move(from, to);
+}
+
+function clearRemoteTerminalReconnectTimer(id: number) {
+  const timer = remoteTerminalReconnectTimers.get(id);
+  if (timer !== undefined) window.clearTimeout(timer);
+  remoteTerminalReconnectTimers.delete(id);
+}
+
+function scheduleRemoteTerminalReconnect(id: number, route: RemoteTerminalRoute) {
+  if (
+    remoteStoppingTerminals.has(id) ||
+    !remoteTerminalRoutes.has(id) ||
+    remoteTerminalReconnectTimers.has(id)
+  ) {
+    return;
+  }
+
+  const attempt = (remoteTerminalReconnectAttempts.get(id) ?? 0) + 1;
+  remoteTerminalReconnectAttempts.set(id, attempt);
+  if (attempt > REMOTE_TERMINAL_MAX_RECONNECTS) {
+    remoteTerminalRoutes.delete(id);
+    remotePendingTerminalInput.clear(id);
+    emit("pty-data", {
+      id,
+      data: "\r\nConnexion au terminal perdue. Ouvre un nouveau terminal pour continuer.\r\n",
+    });
+    emit("pty-exit", { id });
+    return;
+  }
+
+  const delay = Math.min(5_000, 250 * 2 ** (attempt - 1));
+  const timer = window.setTimeout(() => {
+    remoteTerminalReconnectTimers.delete(id);
+    if (!remoteTerminalRoutes.has(id) || remoteStoppingTerminals.has(id)) return;
+    openTerminalSocket(id, remoteTerminalRoutes.get(id) ?? route);
+  }, delay);
+  remoteTerminalReconnectTimers.set(id, timer);
+}
+
+function emitTerminalTransportError(id: number, route: RemoteTerminalRoute, error: unknown) {
+  const message = terminalTransportErrorMessage(route.baseUrl, error);
+  emit("pty-data", { id, data: `\r\n${message}\r\n` });
 }
 
 function emit<T>(event: string, payload: T) {

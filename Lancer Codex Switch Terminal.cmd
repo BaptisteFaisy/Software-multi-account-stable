@@ -2,6 +2,8 @@
 setlocal EnableExtensions
 
 set "APP_DIR=%~dp0"
+rem Toutes les copies du projet partagent les memes comptes et discussions.
+set "CST_DATA_DIR=%APPDATA%\codex-switch-terminal-server"
 set "ROOT_EXE=%APP_DIR%Codex Switch Terminal.exe"
 set "CLOUD_EXE=%APP_DIR%Codex Switch Terminal Cloud.exe"
 set "RELEASE_EXE=%APP_DIR%src-tauri\target\release\codex-switch-terminal.exe"
@@ -123,6 +125,11 @@ exit /b %ERRORLEVEL%
 set "CST_CLIENT_REMOTE=1"
 set "CST_CLIENT_BASE_URL=http://127.0.0.1:8080"
 
+if exist "%RELEASE_EXE%" (
+  start "Codex Switch Terminal Cloud" /D "%APP_DIR%" "%RELEASE_EXE%"
+  exit /b 0
+)
+
 if exist "%ROOT_EXE%" (
   start "Codex Switch Terminal Cloud" /D "%APP_DIR%" "%ROOT_EXE%"
   exit /b 0
@@ -130,11 +137,6 @@ if exist "%ROOT_EXE%" (
 
 if exist "%CLOUD_EXE%" (
   start "Codex Switch Terminal Cloud" /D "%APP_DIR%" "%CLOUD_EXE%"
-  exit /b 0
-)
-
-if exist "%RELEASE_EXE%" (
-  start "Codex Switch Terminal Cloud" /D "%APP_DIR%" "%RELEASE_EXE%"
   exit /b 0
 )
 

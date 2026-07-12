@@ -35,6 +35,7 @@ async fn codex_client_handshakes_and_calls_tools() {
         account_id: "test".into(),
         label: "Tester".into(),
         cwd: None,
+        ..Default::default()
     });
 
     // 2) Serveur MCP sur un port loopback ephemere.
@@ -118,7 +119,10 @@ async fn codex_client_handshakes_and_calls_tools() {
     // tools/list (il ne liste les outils que si l'initialize a reussi).
     let (inits, lists) = room.handshake_counts();
     eprintln!("handshake counts: initialize={inits}, tools/list={lists}");
-    assert!(inits >= 1, "codex n'a pas envoye initialize (handshake echoue)");
+    assert!(
+        inits >= 1,
+        "codex n'a pas envoye initialize (handshake echoue)"
+    );
     assert!(
         lists >= 1,
         "codex n'a pas liste les outils (notre initialize a ete rejete ?)"

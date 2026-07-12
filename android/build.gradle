@@ -1,0 +1,5 @@
+// Racine du projet Android. Le plugin est declare ici (apply false) puis
+// applique dans app/build.gradle.
+plugins {
+    id 'com.android.application' version '8.7.2' apply false
+}

@@ -1,13 +1,24 @@
 mod account_usage;
 pub mod agent_room;
+mod chat;
 mod client_startup;
+pub mod devices;
 mod discussions;
+mod fs_util;
 mod kombai;
+mod merge_queue;
 mod metrics;
 mod pool;
+mod provider;
+mod security;
 pub mod server;
 mod settings;
 mod terminal;
+mod worktree;
+
+// `Provider` fait partie de l'API publique (champ de `agent_room::AgentMeta`,
+// DTOs serveur) : on le re-exporte pour qu'il soit nommable hors du crate.
+pub use settings::Provider;
 
 use agent_room::RoomState;
 use pool::PoolManager;
@@ -27,7 +38,7 @@ struct PoolState {
 }
 
 struct RoomRuntime {
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
     port: u16,
 }
 
@@ -39,14 +50,6 @@ struct RoomServer {
 }
 
 const DEFAULT_ROOM_PORT: u16 = 8123;
-
-fn stop_room(server: &RoomServer) {
-    if let Ok(mut guard) = server.runtime.lock() {
-        if let Some(rt) = guard.take() {
-            let _ = rt.shutdown.send(());
-        }
-    }
-}
 
 /// Construit le RoomState persiste (repertoire aligne sur CST_DATA_DIR), avec
 /// repli en memoire seule si le repertoire n'est pas resolvable.
@@ -77,27 +80,38 @@ async fn serve_room(
 }
 
 pub fn run() {
+    let worktrees = settings::runtime_data_dir()
+        .and_then(|root| worktree::WorktreeManager::from_env(root.join("agents")))
+        .expect("initialisation du gestionnaire de worktrees impossible");
+    let _ = worktrees.sweep_stale(7 * 24 * 60 * 60);
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(terminal::TerminalManager::default())
+        .manage(chat::ChatTurnManager::default())
+        .manage(worktrees)
         .manage(PoolState::default())
         .manage(build_room_state())
         .manage(RoomServer::default())
         .manage(kombai::KombaiManager::default())
         .setup(|app| {
-            // Auto-demarrage du salon au boot s'il est active dans les settings.
-            if let Ok(settings) = settings::load_settings_for_terminal() {
-                if settings.agent_room.enabled {
-                    let room = app.state::<RoomState>().inner().clone();
-                    let server = app.state::<RoomServer>();
-                    let port = settings.agent_room.port;
-                    if let Ok(tx) = tauri::async_runtime::block_on(serve_room(room, port)) {
-                        if let Ok(mut guard) = server.runtime.lock() {
-                            *guard = Some(RoomRuntime { shutdown: tx, port });
-                        }
+            // Collaboration workspace native : toujours disponible, sans
+            // activation utilisateur. Le port historique reste configurable.
+            let port = settings::load_settings_for_terminal()
+                .map(|settings| settings.agent_room.port)
+                .unwrap_or(DEFAULT_ROOM_PORT);
+            let room = app.state::<RoomState>().inner().clone();
+            let server = app.state::<RoomServer>();
+            match tauri::async_runtime::block_on(serve_room(room, port)) {
+                Ok(tx) => {
+                    if let Ok(mut guard) = server.runtime.lock() {
+                        *guard = Some(RoomRuntime {
+                            _shutdown: tx,
+                            port,
+                        });
                     }
                 }
+                Err(error) => eprintln!("[workspace_collab] demarrage impossible: {error}"),
             }
             Ok(())
         })
@@ -117,6 +131,7 @@ pub fn run() {
             settings::import_account_json,
             settings::remove_account,
             settings::account_limit_status,
+            settings::account_model_catalog,
             settings::pick_project_dir,
             metrics::usage_dashboard,
             account_usage::account_token_usage,
@@ -124,7 +139,13 @@ pub fn run() {
             discussions::list_prompt_history,
             discussions::claim_session_for_terminal,
             discussions::copy_discussion_to_account,
+            discussions::move_discussion,
+            discussions::export_discussion_transcript,
+            discussions::get_discussion_transcript,
             discussions::delete_discussion,
+            chat::start_chat_turn,
+            chat::chat_turn_status,
+            chat::stop_chat_turn,
             terminal::start_terminal,
             terminal::write_terminal,
             terminal::resize_terminal,
@@ -138,8 +159,6 @@ pub fn run() {
             pool_stop,
             pool_status,
             pool_pick_terminal_account,
-            room_enable,
-            room_disable,
             room_status,
             room_messages,
             room_send
@@ -183,7 +202,10 @@ async fn pool_start(state: tauri::State<'_, PoolState>) -> Result<Value, String>
         .map_err(|e| format!("port {port} indisponible: {e}"))?;
 
     let manager = Arc::new(PoolManager::build(&settings)?);
-    let router = pool::router(manager.clone());
+    // Pool local desktop : proxy purement loopback, pas d'admin_token dans ce
+    // process -> pas de jeton break-glass (l'auth reste facultative via la cle
+    // API du pool si l'utilisateur en configure une).
+    let router = pool::router(manager.clone(), None);
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
     tauri::async_runtime::spawn(async move {
@@ -235,15 +257,17 @@ fn pool_pick_terminal_account(
     state: tauri::State<'_, PoolState>,
 ) -> Result<settings::AccountProfile, String> {
     let settings = settings::load_settings_for_terminal()?;
+    // Le pool ChatGPT ne rotationne que des comptes Codex authentifies (auth.json).
     let accounts = settings
         .accounts
         .into_iter()
+        .filter(|account| account.provider == settings::Provider::Codex)
         .filter(settings::account_has_auth_tokens)
         .collect::<Vec<_>>();
 
     if accounts.is_empty() {
         return Err(
-            "Aucun compte avec auth.json dans le pool. Importe d'abord des JSON.".to_string(),
+            "Aucun compte Codex avec auth.json dans le pool. Importe d'abord des JSON.".to_string(),
         );
     }
 
@@ -277,7 +301,7 @@ fn pool_snapshot(manager: &Arc<PoolManager>, running: bool, port: u16) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// Salon d'agents (Agent Room)
+// Collaboration native du workspace
 // ---------------------------------------------------------------------------
 
 fn room_running_port(server: &RoomServer) -> Option<u16> {
@@ -288,60 +312,16 @@ fn room_running_port(server: &RoomServer) -> Option<u16> {
         .and_then(|guard| guard.as_ref().map(|rt| rt.port))
 }
 
-/// Active le salon : persiste `enabled=true` + le port, et demarre le serveur
-/// MCP loopback. Le provisioning des `CODEX_HOME` se fait paresseusement au
-/// lancement de chaque terminal (cf. `terminal::start_terminal`).
-#[tauri::command]
-async fn room_enable(
-    room: tauri::State<'_, RoomState>,
-    server: tauri::State<'_, RoomServer>,
-    port: Option<u16>,
-) -> Result<Value, String> {
-    let mut settings = settings::load_settings_for_terminal()?;
-    if let Some(p) = port {
-        settings.agent_room.port = p;
-    }
-    settings.agent_room.enabled = true;
-    let port = settings.agent_room.port;
-    settings::save_settings(settings)?;
-
-    stop_room(&server);
-    let tx = serve_room(room.inner().clone(), port).await?;
-    if let Ok(mut guard) = server.runtime.lock() {
-        *guard = Some(RoomRuntime { shutdown: tx, port });
-    }
-    Ok(json!({ "running": true, "port": port, "url": format!("http://127.0.0.1:{port}/mcp") }))
-}
-
-/// Desactive le salon : arrete le serveur, persiste `enabled=false`, et retire
-/// l'entree `[mcp_servers.agent_room]` de chaque `CODEX_HOME` (reversible).
-#[tauri::command]
-fn room_disable(
-    room: tauri::State<'_, RoomState>,
-    server: tauri::State<'_, RoomServer>,
-) -> Result<Value, String> {
-    stop_room(&server);
-    let mut settings = settings::load_settings_for_terminal()?;
-    settings.agent_room.enabled = false;
-    let codex_bin = settings.codex_command.clone();
-    // Deprovision de chaque compte (best-effort).
-    for account in &settings.accounts {
-        if let Ok(home) = settings::expand_home(&account.codex_home) {
-            room.deprovision_home(&codex_bin, &home);
-        }
-    }
-    settings::save_settings(settings)?;
-    Ok(json!({ "running": false }))
-}
-
 #[tauri::command]
 fn room_status(
     room: tauri::State<'_, RoomState>,
     server: tauri::State<'_, RoomServer>,
+    workspace_path: Option<String>,
 ) -> Result<Value, String> {
     let running_port = room_running_port(&server);
     let port = running_port.unwrap_or(DEFAULT_ROOM_PORT);
-    let snapshot = room.snapshot();
+    let room_id = desktop_room_id(workspace_path.as_deref())?;
+    let snapshot = room.snapshot_for_room(&room_id);
     Ok(json!({
         "running": running_port.is_some(),
         "port": port,
@@ -351,9 +331,18 @@ fn room_status(
 }
 
 #[tauri::command]
-fn room_messages(room: tauri::State<'_, RoomState>, since: Option<u64>) -> Result<Value, String> {
-    let messages = room.messages_for(agent_room::OPERATOR_IDENT, since.unwrap_or(0));
-    let cursor = messages.iter().map(|m| m.id).max().unwrap_or_else(|| since.unwrap_or(0));
+fn room_messages(
+    room: tauri::State<'_, RoomState>,
+    since: Option<u64>,
+    workspace_path: Option<String>,
+) -> Result<Value, String> {
+    let room_id = desktop_room_id(workspace_path.as_deref())?;
+    let messages = room.messages_for_room(&room_id, agent_room::OPERATOR_IDENT, since.unwrap_or(0));
+    let cursor = messages
+        .iter()
+        .map(|m| m.id)
+        .max()
+        .unwrap_or_else(|| since.unwrap_or(0));
     Ok(json!({ "messages": messages, "cursor": cursor }))
 }
 
@@ -364,11 +353,32 @@ fn room_send(
     room: tauri::State<'_, RoomState>,
     text: String,
     to: Option<String>,
+    workspace_path: Option<String>,
 ) -> Result<Value, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err("message vide".to_string());
     }
-    let message = room.operator_post(to, text);
+    let room_id = desktop_room_id(workspace_path.as_deref())?;
+    if let Some(target) = to.as_deref() {
+        if !room.ident_exists_in_room(&room_id, target) {
+            return Err("destinataire absent du dossier actif".to_string());
+        }
+    }
+    let message = room.operator_post_in_room(&room_id, to, text);
     serde_json::to_value(message).map_err(|e| e.to_string())
+}
+
+fn desktop_room_id(workspace_path: Option<&str>) -> Result<String, String> {
+    let Some(raw) = workspace_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(agent_room::DEFAULT_ROOM_ID.to_string());
+    };
+    let path = settings::expand_home(raw)?;
+    if !path.is_dir() {
+        return Err(format!("dossier introuvable: {raw}"));
+    }
+    Ok(worktree::room_id_for_local_path(&path))
 }
